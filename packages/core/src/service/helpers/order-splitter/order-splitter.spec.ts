@@ -1,426 +1,471 @@
 import { Test } from '@nestjs/testing';
-import { CurrencyCode, OrderType } from '@vendure/common/lib/generated-types';
+import { CurrencyCode, LanguageCode, OrderType } from '@vendure/common/lib/generated-types';
+import { ID } from '@vendure/common/lib/shared-types';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { RequestContext } from '../../../api/common/request-context';
 import { InternalServerError } from '../../../common/error/errors';
 import { ConfigService } from '../../../config/config.service';
-import { MockConfigService } from '../../../config/config.service.mock';
-import { OrderSellerStrategy, SplitOrderContents } from '../../../config/order/order-seller-strategy';
+import { SplitOrderContents } from '../../../config/order/order-seller-strategy';
 import { TransactionalConnection } from '../../../connection/transactional-connection';
 import { Channel } from '../../../entity/channel/channel.entity';
-import { Customer } from '../../../entity/customer/customer.entity';
 import { OrderLine } from '../../../entity/order-line/order-line.entity';
 import { Order } from '../../../entity/order/order.entity';
-import { ProductVariant } from '../../../entity/product-variant/product-variant.entity';
 import { ShippingLine } from '../../../entity/shipping-line/shipping-line.entity';
 import { ChannelService } from '../../services/channel.service';
 import { OrderService } from '../../services/order.service';
 
 import { OrderSplitter } from './order-splitter';
 
-const DEFAULT_CHANNEL_ID = 1;
-const SELLER_CHANNEL_ID = 2;
+const DEFAULT_CHANNEL_ID = 'T_1';
+const SELLER_CHANNEL_ID = 'T_2';
 
-const defaultChannel = new Channel({ id: DEFAULT_CHANNEL_ID, code: '__default_channel__' });
-const sellerChannel = new Channel({ id: SELLER_CHANNEL_ID, code: 'seller' });
+function createChannel(id: ID, code: string): Channel {
+    return new Channel({
+        id,
+        code,
+        defaultLanguageCode: LanguageCode.en,
+        defaultCurrencyCode: CurrencyCode.USD,
+    });
+}
 
-/**
- * Stands in for a TypeORM Repository. `save` assigns an incrementing id to new entities and
- * returns the entity, so that the saved seller Order and its duplicated lines can be inspected.
- * The `relation().add()` chain records what was linked to the aggregate Order.
- */
-function createFakeRepository(prefix: string) {
-    let nextId = 1;
-    const saved: any[] = [];
-    const relationAdds: Array<{ relation: string; of: any; added: any }> = [];
-    const repo = {
-        saved,
-        relationAdds,
-        save: vi.fn(async (entity: any) => {
-            if (entity.id == null) {
-                entity.id = `${prefix}-${nextId++}`;
-            }
-            saved.push(entity);
-            return entity;
-        }),
-        createQueryBuilder: () => ({
-            relation: (relation: string) => ({
-                of: (of: any) => ({
-                    add: async (added: any) => {
-                        relationAdds.push({ relation, of, added });
-                    },
-                }),
-            }),
-        }),
-    };
-    return repo;
+const defaultChannel = createChannel(DEFAULT_CHANNEL_ID, '__default_channel__');
+const sellerChannel = createChannel(SELLER_CHANNEL_ID, 'seller-channel');
+
+function createCtx(): RequestContext {
+    return new RequestContext({
+        apiType: 'shop',
+        channel: defaultChannel,
+        languageCode: LanguageCode.de,
+        currencyCode: CurrencyCode.GBP,
+        session: { id: 'session-1' } as any,
+        isAuthorized: true,
+        authorizedAsOwnerOnly: false,
+    });
+}
+
+function createOrderLine(id: ID, overrides: Partial<OrderLine> = {}): OrderLine {
+    return new OrderLine({
+        id,
+        quantity: 2,
+        orderPlacedQuantity: 2,
+        productVariantId: `variant-${id as string}`,
+        taxCategoryId: 'T_1',
+        listPrice: 1000,
+        listPriceIncludesTax: true,
+        initialListPrice: 1000,
+        adjustments: [],
+        taxLines: [{ description: 'tax', taxRate: 20 }],
+        customFields: {},
+        ...overrides,
+    } as any);
+}
+
+function createShippingLine(id: ID): ShippingLine {
+    return new ShippingLine({
+        id,
+        shippingMethodId: `method-${id as string}`,
+        listPrice: 500,
+        listPriceIncludesTax: true,
+        adjustments: [],
+        taxLines: [],
+    } as any);
+}
+
+function createAggregateOrder(): Order {
+    return new Order({
+        id: 'T_10',
+        type: OrderType.Regular,
+        code: 'AGGREGATE_CODE',
+        currencyCode: CurrencyCode.GBP,
+        couponCodes: ['SUMMER'],
+        customer: { id: 'T_5' } as any,
+        shippingAddress: { streetLine1: '1 Test St', countryCode: 'GB' },
+        billingAddress: { streetLine1: '2 Test St', countryCode: 'GB' },
+        lines: [],
+        surcharges: [],
+        shippingLines: [],
+        modifications: [],
+    });
 }
 
 describe('OrderSplitter', () => {
     let orderSplitter: OrderSplitter;
-    let mockConfigService: MockConfigService;
-    let orderRepo: ReturnType<typeof createFakeRepository>;
-    let orderLineRepo: ReturnType<typeof createFakeRepository>;
-    let shippingLineRepo: ReturnType<typeof createFakeRepository>;
-    let channelService: { getDefaultChannel: ReturnType<typeof vi.fn>; findOne: ReturnType<typeof vi.fn> };
-    let orderService: { applyPriceAdjustments: ReturnType<typeof vi.fn> };
-    let orderSellerStrategy: {
-        splitOrder: ReturnType<typeof vi.fn>;
-        afterSellerOrdersCreated: ReturnType<typeof vi.fn>;
-    };
-    const ctx = RequestContext.empty();
+    let ctx: RequestContext;
+    let order: Order;
+    let splitOrder: ReturnType<typeof vi.fn>;
+    let afterSellerOrdersCreated: ReturnType<typeof vi.fn>;
+    let generateCode: ReturnType<typeof vi.fn>;
+    let applyPriceAdjustments: ReturnType<typeof vi.fn>;
+    let channelFindOne: ReturnType<typeof vi.fn>;
+    let relationAdd: ReturnType<typeof vi.fn>;
+    let savedOrders: Order[];
+    let savedOrderLines: OrderLine[];
+    let savedShippingLines: ShippingLine[];
+    let getRepository: ReturnType<typeof vi.fn>;
 
     beforeEach(async () => {
-        orderRepo = createFakeRepository('order');
-        orderLineRepo = createFakeRepository('line');
-        shippingLineRepo = createFakeRepository('shipping');
-        const repositories = new Map<any, any>([
-            [Order, orderRepo],
-            [OrderLine, orderLineRepo],
-            [ShippingLine, shippingLineRepo],
-        ]);
-        const connection = {
-            getRepository: vi.fn((_ctx: RequestContext, entity: any) => repositories.get(entity)),
+        ctx = createCtx();
+        order = createAggregateOrder();
+        savedOrders = [];
+        savedOrderLines = [];
+        savedShippingLines = [];
+        splitOrder = vi.fn();
+        afterSellerOrdersCreated = vi.fn();
+        generateCode = vi.fn(async () => `SELLER_CODE_${generateCode.mock.calls.length}`);
+        applyPriceAdjustments = vi.fn(async () => undefined);
+        channelFindOne = vi.fn(async (_ctx: RequestContext, id: ID) =>
+            [defaultChannel, sellerChannel].find(c => c.id === id),
+        );
+        relationAdd = vi.fn(async () => undefined);
+
+        let nextId = 100;
+        const save = (collection: any[]) =>
+            vi.fn(async (entity: any) => {
+                entity.id = `saved_${nextId++}`;
+                collection.push(entity);
+                return entity;
+            });
+        const orderRepository = {
+            save: save(savedOrders),
+            createQueryBuilder: () => ({
+                relation: () => ({
+                    of: () => ({ add: relationAdd }),
+                }),
+            }),
         };
-        channelService = {
-            getDefaultChannel: vi.fn().mockResolvedValue(defaultChannel),
-            findOne: vi.fn(async (_ctx: RequestContext, id: any) =>
-                id === SELLER_CHANNEL_ID
-                    ? sellerChannel
-                    : id === DEFAULT_CHANNEL_ID
-                      ? defaultChannel
-                      : undefined,
-            ),
-        };
-        orderService = {
-            applyPriceAdjustments: vi.fn(async (_ctx: RequestContext, order: Order) => order),
-        };
-        orderSellerStrategy = {
-            splitOrder: vi.fn().mockResolvedValue([]),
-            afterSellerOrdersCreated: vi.fn().mockResolvedValue(undefined),
-        };
+        const orderLineRepository = { save: save(savedOrderLines) };
+        const shippingLineRepository = { save: save(savedShippingLines) };
+        getRepository = vi.fn((_ctx: RequestContext, entity: any) => {
+            switch (entity) {
+                case Order:
+                    return orderRepository;
+                case OrderLine:
+                    return orderLineRepository;
+                case ShippingLine:
+                    return shippingLineRepository;
+                default:
+                    throw new Error(`No mock repository for ${String(entity)}`);
+            }
+        });
 
         const module = await Test.createTestingModule({
             providers: [
                 OrderSplitter,
-                { provide: ConfigService, useClass: MockConfigService },
-                { provide: TransactionalConnection, useValue: connection },
-                { provide: ChannelService, useValue: channelService },
-                { provide: OrderService, useValue: orderService },
+                { provide: TransactionalConnection, useValue: { getRepository } },
+                {
+                    provide: ConfigService,
+                    useValue: {
+                        orderOptions: {
+                            orderSellerStrategy: { splitOrder, afterSellerOrdersCreated },
+                            orderCodeStrategy: { generate: generateCode },
+                        },
+                    },
+                },
+                {
+                    provide: ChannelService,
+                    useValue: {
+                        getDefaultChannel: async () => defaultChannel,
+                        findOne: channelFindOne,
+                    },
+                },
+                { provide: OrderService, useValue: { applyPriceAdjustments } },
             ],
         }).compile();
-        mockConfigService = module.get<ConfigService, MockConfigService>(ConfigService);
-        mockConfigService.orderOptions = {
-            orderSellerStrategy: orderSellerStrategy as unknown as OrderSellerStrategy,
-            orderCodeStrategy: { generate: vi.fn().mockReturnValue('SELLER-CODE') },
-        };
+
         orderSplitter = module.get(OrderSplitter);
     });
 
-    function createAggregateOrder(): Order {
-        const shippingLine = new ShippingLine({
-            id: 10,
-            shippingMethodId: 55,
-            listPrice: 500,
-            listPriceIncludesTax: true,
-            adjustments: [],
-            taxLines: [{ taxRate: 20, description: 'tax' }],
-        });
-        const line = new OrderLine({
-            id: 20,
-            quantity: 3,
-            orderPlacedQuantity: 3,
-            productVariant: new ProductVariant({ id: 100 }),
-            productVariantId: 100,
-            listPrice: 1000,
-            listPriceIncludesTax: true,
-            adjustments: [],
-            taxLines: [],
-            shippingLineId: shippingLine.id,
-            sellerChannelId: SELLER_CHANNEL_ID,
-        });
-        return new Order({
-            id: 1,
-            code: 'AGGREGATE',
-            type: OrderType.Regular,
-            customer: new Customer({ id: 7 }),
-            lines: [line],
-            shippingLines: [shippingLine],
-            couponCodes: ['SAVE10'],
-            currencyCode: CurrencyCode.USD,
-            shippingAddress: { streetLine1: 'Ship St' },
-            billingAddress: { streetLine1: 'Bill St' },
-            sellerOrders: [],
-        });
+    function splitInto(...partials: Array<Partial<SplitOrderContents>>) {
+        splitOrder.mockResolvedValue(
+            partials.map(partial => ({
+                channelId: SELLER_CHANNEL_ID,
+                state: 'PaymentSettled',
+                lines: [],
+                shippingLines: [],
+                ...partial,
+            })),
+        );
     }
 
-    function splitInto(order: Order, channelId = SELLER_CHANNEL_ID): SplitOrderContents[] {
-        return [
-            {
-                channelId,
-                state: 'ArrangingPayment',
-                lines: order.lines,
-                shippingLines: order.shippingLines,
-            },
-        ];
-    }
-
-    describe('when no split is needed', () => {
-        it('returns an empty array when the strategy has no splitOrder method', async () => {
-            mockConfigService.orderOptions.orderSellerStrategy = {} as OrderSellerStrategy;
-            const order = createAggregateOrder();
+    describe('when no split is required', () => {
+        it('returns an empty array and persists nothing when the strategy returns no partial orders', async () => {
+            splitOrder.mockResolvedValue([]);
 
             const result = await orderSplitter.createSellerOrders(ctx, order);
 
             expect(result).toEqual([]);
+            expect(getRepository).not.toHaveBeenCalled();
             expect(order.type).toBe(OrderType.Regular);
+            expect(afterSellerOrdersCreated).not.toHaveBeenCalled();
         });
 
-        it('returns an empty array and saves nothing when splitOrder returns no partial orders', async () => {
-            const order = createAggregateOrder();
+        it('returns an empty array when the strategy returns undefined', async () => {
+            splitOrder.mockResolvedValue(undefined);
 
             const result = await orderSplitter.createSellerOrders(ctx, order);
 
             expect(result).toEqual([]);
-            expect(order.type).toBe(OrderType.Regular);
-            expect(orderRepo.save).not.toHaveBeenCalled();
-            expect(channelService.getDefaultChannel).not.toHaveBeenCalled();
-            expect(orderSellerStrategy.afterSellerOrdersCreated).not.toHaveBeenCalled();
+            expect(getRepository).not.toHaveBeenCalled();
         });
 
-        it('passes the ctx and order to the strategy', async () => {
-            const order = createAggregateOrder();
+        it('returns an empty array when the strategy does not implement splitOrder', async () => {
+            const module = await Test.createTestingModule({
+                providers: [
+                    OrderSplitter,
+                    { provide: TransactionalConnection, useValue: { getRepository } },
+                    {
+                        provide: ConfigService,
+                        useValue: {
+                            orderOptions: {
+                                orderSellerStrategy: {},
+                                orderCodeStrategy: { generate: generateCode },
+                            },
+                        },
+                    },
+                    { provide: ChannelService, useValue: { getDefaultChannel: async () => defaultChannel } },
+                    { provide: OrderService, useValue: { applyPriceAdjustments } },
+                ],
+            }).compile();
 
-            await orderSplitter.createSellerOrders(ctx, order);
+            const result = await module.get(OrderSplitter).createSellerOrders(ctx, order);
 
-            expect(orderSellerStrategy.splitOrder).toHaveBeenCalledWith(ctx, order);
+            expect(result).toEqual([]);
+            expect(getRepository).not.toHaveBeenCalled();
         });
     });
 
-    describe('when the order is split', () => {
-        it('marks the original order as an Aggregate order', async () => {
-            const order = createAggregateOrder();
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order));
+    describe('seller Order creation', () => {
+        it('marks the source Order as an aggregate Order', async () => {
+            splitInto({});
 
             await orderSplitter.createSellerOrders(ctx, order);
 
             expect(order.type).toBe(OrderType.Aggregate);
         });
 
-        it('creates a Seller order copying the aggregate order data', async () => {
-            const order = createAggregateOrder();
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order));
+        it('creates one seller Order per partial order, each with its own generated code', async () => {
+            splitInto({ channelId: SELLER_CHANNEL_ID }, { channelId: SELLER_CHANNEL_ID });
 
             await orderSplitter.createSellerOrders(ctx, order);
 
-            const sellerOrder = orderRepo.saved[0] as Order;
-            expect(sellerOrder).toBeInstanceOf(Order);
-            expect(sellerOrder).not.toBe(order);
-            expect(sellerOrder.type).toBe(OrderType.Seller);
+            expect(savedOrders.length).toBe(2);
+            expect(savedOrders.map(o => o.code)).toEqual(['SELLER_CODE_1', 'SELLER_CODE_2']);
+            expect(savedOrders.every(o => o.type === OrderType.Seller)).toBe(true);
+        });
+
+        it('links the seller Order to the aggregate Order and marks it as placed and inactive', async () => {
+            splitInto({ state: 'ArrangingPayment' });
+
+            await orderSplitter.createSellerOrders(ctx, order);
+
+            const [sellerOrder] = savedOrders;
             expect(sellerOrder.aggregateOrderId).toBe(order.id);
-            expect(sellerOrder.code).toBe('SELLER-CODE');
             expect(sellerOrder.active).toBe(false);
-            expect(sellerOrder.orderPlacedAt).toBeInstanceOf(Date);
             expect(sellerOrder.state).toBe('ArrangingPayment');
+            expect(sellerOrder.orderPlacedAt).toBeInstanceOf(Date);
+        });
+
+        it('copies customer-facing data from the aggregate Order and zeroes the totals', async () => {
+            splitInto({});
+
+            await orderSplitter.createSellerOrders(ctx, order);
+
+            const [sellerOrder] = savedOrders;
             expect(sellerOrder.customer).toBe(order.customer);
-            expect(sellerOrder.couponCodes).toEqual(['SAVE10']);
-            expect(sellerOrder.currencyCode).toBe(CurrencyCode.USD);
-            expect(sellerOrder.shippingAddress).toEqual({ streetLine1: 'Ship St' });
-            expect(sellerOrder.billingAddress).toEqual({ streetLine1: 'Bill St' });
+            expect(sellerOrder.couponCodes).toEqual(['SUMMER']);
+            expect(sellerOrder.shippingAddress).toEqual(order.shippingAddress);
+            expect(sellerOrder.billingAddress).toEqual(order.billingAddress);
+            expect(sellerOrder.currencyCode).toBe(CurrencyCode.GBP);
             expect(sellerOrder.subTotal).toBe(0);
             expect(sellerOrder.subTotalWithTax).toBe(0);
             expect(sellerOrder.surcharges).toEqual([]);
             expect(sellerOrder.modifications).toEqual([]);
         });
 
-        it('assigns the seller order to the seller channel and the default channel', async () => {
-            const order = createAggregateOrder();
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order, SELLER_CHANNEL_ID));
+        it('adds the seller Order to the aggregate Order sellerOrders relation', async () => {
+            splitInto({});
 
             await orderSplitter.createSellerOrders(ctx, order);
 
-            const sellerOrder = orderRepo.saved[0] as Order;
-            expect(sellerOrder.channels.map(c => c.id)).toEqual([SELLER_CHANNEL_ID, DEFAULT_CHANNEL_ID]);
-            expect(sellerOrder.channels[1]).toBe(defaultChannel);
+            expect(relationAdd).toHaveBeenCalledTimes(1);
+            expect(relationAdd).toHaveBeenCalledWith(savedOrders[0]);
         });
 
-        it('assigns the seller order to only the default channel when that is the seller channel', async () => {
-            const order = createAggregateOrder();
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order, DEFAULT_CHANNEL_ID));
+        it('passes the created seller Orders to afterSellerOrdersCreated', async () => {
+            splitInto({}, {});
 
             await orderSplitter.createSellerOrders(ctx, order);
 
-            const sellerOrder = orderRepo.saved[0] as Order;
-            expect(sellerOrder.channels).toEqual([defaultChannel]);
+            expect(afterSellerOrdersCreated).toHaveBeenCalledWith(ctx, order, savedOrders);
         });
 
-        it('duplicates the order lines as new entities with the pricing data copied', async () => {
-            const order = createAggregateOrder();
-            const [originalLine] = order.lines;
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order));
+        it('still creates seller Orders when the strategy has no afterSellerOrdersCreated hook', async () => {
+            const module = await Test.createTestingModule({
+                providers: [
+                    OrderSplitter,
+                    { provide: TransactionalConnection, useValue: { getRepository } },
+                    {
+                        provide: ConfigService,
+                        useValue: {
+                            orderOptions: {
+                                orderSellerStrategy: { splitOrder },
+                                orderCodeStrategy: { generate: generateCode },
+                            },
+                        },
+                    },
+                    {
+                        provide: ChannelService,
+                        useValue: { getDefaultChannel: async () => defaultChannel, findOne: channelFindOne },
+                    },
+                    { provide: OrderService, useValue: { applyPriceAdjustments } },
+                ],
+            }).compile();
+            splitInto({});
 
-            await orderSplitter.createSellerOrders(ctx, order);
+            await module.get(OrderSplitter).createSellerOrders(ctx, order);
 
-            const sellerOrder = orderRepo.saved[0] as Order;
-            expect(sellerOrder.lines).toHaveLength(1);
-            const [newLine] = sellerOrder.lines;
-            expect(newLine).toBeInstanceOf(OrderLine);
-            expect(newLine).not.toBe(originalLine);
-            expect(newLine.id).not.toBe(originalLine.id);
-            expect(newLine.quantity).toBe(3);
-            expect(newLine.orderPlacedQuantity).toBe(3);
-            expect(newLine.productVariantId).toBe(100);
-            expect(newLine.productVariant).toBe(originalLine.productVariant);
-            expect(newLine.listPrice).toBe(1000);
-            expect(newLine.listPriceIncludesTax).toBe(true);
-            expect(newLine.sellerChannelId).toBe(SELLER_CHANNEL_ID);
-            expect(order.lines[0]).toBe(originalLine);
+            expect(savedOrders.length).toBe(1);
         });
 
-        it('duplicates the shipping lines and re-points the new lines at the new shipping line', async () => {
-            const order = createAggregateOrder();
-            const [originalShippingLine] = order.shippingLines;
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order));
-
-            await orderSplitter.createSellerOrders(ctx, order);
-
-            const sellerOrder = orderRepo.saved[0] as Order;
-            expect(sellerOrder.shippingLines).toHaveLength(1);
-            const [newShippingLine] = sellerOrder.shippingLines;
-            expect(newShippingLine).toBeInstanceOf(ShippingLine);
-            expect(newShippingLine).not.toBe(originalShippingLine);
-            expect(newShippingLine.shippingMethodId).toBe(55);
-            expect(newShippingLine.listPrice).toBe(500);
-            expect(newShippingLine.taxLines).toEqual([{ taxRate: 20, description: 'tax' }]);
-            expect(sellerOrder.lines[0].shippingLineId).toBe(newShippingLine.id);
-            expect(originalShippingLine.id).toBe(10);
-            // the re-pointed line is persisted a second time
-            expect(orderLineRepo.save).toHaveBeenCalledTimes(2);
-            expect(orderLineRepo.save).toHaveBeenLastCalledWith(sellerOrder.lines[0]);
-        });
-
-        it('leaves lines that belong to a different shipping line untouched', async () => {
-            const order = createAggregateOrder();
-            order.lines[0].shippingLineId = 999;
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order));
-
-            await orderSplitter.createSellerOrders(ctx, order);
-
-            const sellerOrder = orderRepo.saved[0] as Order;
-            expect(sellerOrder.lines[0].shippingLineId).toBe(999);
-            expect(orderLineRepo.save).toHaveBeenCalledTimes(1);
-        });
-
-        it('links each seller order to the aggregate order via the sellerOrders relation', async () => {
-            const order = createAggregateOrder();
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order));
-
-            await orderSplitter.createSellerOrders(ctx, order);
-
-            expect(orderRepo.relationAdds).toEqual([
-                { relation: 'sellerOrders', of: order, added: orderRepo.saved[0] },
-            ]);
-        });
-
-        it('applies price adjustments in a context scoped to the seller channel', async () => {
-            const order = createAggregateOrder();
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order));
-
-            await orderSplitter.createSellerOrders(ctx, order);
-
-            expect(orderService.applyPriceAdjustments).toHaveBeenCalledTimes(1);
-            const [sellerCtx, sellerOrder, promotions, updatedLines, options] =
-                orderService.applyPriceAdjustments.mock.calls[0];
-            expect(sellerCtx).not.toBe(ctx);
-            expect(sellerCtx).toBeInstanceOf(RequestContext);
-            expect(sellerCtx.channel).toBe(sellerChannel);
-            expect(sellerCtx.apiType).toBe(ctx.apiType);
-            expect(sellerCtx.languageCode).toBe(ctx.languageCode);
-            expect(sellerOrder).toBe(orderRepo.saved[0]);
-            expect(promotions).toBeUndefined();
-            expect(updatedLines).toBeUndefined();
-            expect(options).toEqual({ recalculateShipping: false, recalculateShippingPromotions: true });
-        });
-
-        it('creates one seller order per partial order', async () => {
-            const order = createAggregateOrder();
-            const secondLine = new OrderLine({
-                id: 21,
-                quantity: 1,
-                productVariantId: 101,
-                productVariant: new ProductVariant({ id: 101 }),
-                adjustments: [],
-                taxLines: [],
-            });
-            order.lines.push(secondLine);
-            orderSellerStrategy.splitOrder.mockResolvedValue([
-                {
-                    channelId: SELLER_CHANNEL_ID,
-                    state: 'ArrangingPayment',
-                    lines: [order.lines[0]],
-                    shippingLines: order.shippingLines,
-                },
-                {
-                    channelId: DEFAULT_CHANNEL_ID,
-                    state: 'PaymentSettled',
-                    lines: [secondLine],
-                    shippingLines: [],
-                },
-            ]);
-
-            await orderSplitter.createSellerOrders(ctx, order);
-
-            expect(orderRepo.saved).toHaveLength(2);
-            const [first, second] = orderRepo.saved as Order[];
-            expect(first.lines[0].productVariantId).toBe(100);
-            expect(first.state).toBe('ArrangingPayment');
-            expect(second.lines[0].productVariantId).toBe(101);
-            expect(second.state).toBe('PaymentSettled');
-            expect(second.shippingLines).toEqual([]);
-            expect(orderRepo.relationAdds.map(r => r.added)).toEqual([first, second]);
-            expect(orderService.applyPriceAdjustments).toHaveBeenCalledTimes(2);
-        });
-
-        it('invokes afterSellerOrdersCreated with the created seller orders', async () => {
-            const order = createAggregateOrder();
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order));
-
-            await orderSplitter.createSellerOrders(ctx, order);
-
-            expect(orderSellerStrategy.afterSellerOrdersCreated).toHaveBeenCalledWith(ctx, order, [
-                orderRepo.saved[0],
-            ]);
-        });
-
-        it('tolerates a strategy without afterSellerOrdersCreated', async () => {
-            const order = createAggregateOrder();
-            mockConfigService.orderOptions.orderSellerStrategy = {
-                splitOrder: orderSellerStrategy.splitOrder,
-            } as unknown as OrderSellerStrategy;
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order));
-
-            await expect(orderSplitter.createSellerOrders(ctx, order)).resolves.toBeDefined();
-            expect(orderRepo.saved).toHaveLength(1);
-        });
-
-        it('returns the sellerOrders relation of the aggregate order', async () => {
-            const order = createAggregateOrder();
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order));
+        it('returns the sellerOrders relation of the aggregate Order', async () => {
+            const existing = new Order({ id: 'T_99' });
+            order.sellerOrders = [existing];
+            splitInto({});
 
             const result = await orderSplitter.createSellerOrders(ctx, order);
 
-            expect(result).toBe(order.sellerOrders);
+            // The seller Orders are attached via a relation query, which does not update the
+            // in-memory `order.sellerOrders`, so the return value reflects whatever was already
+            // loaded on the entity rather than the Orders just created.
+            expect(result).toEqual([existing]);
+        });
+    });
+
+    describe('Channel assignment', () => {
+        it('assigns the seller Channel alongside the default Channel', async () => {
+            splitInto({ channelId: SELLER_CHANNEL_ID });
+
+            await orderSplitter.createSellerOrders(ctx, order);
+
+            expect(savedOrders[0].channels.map(c => c.id)).toEqual([SELLER_CHANNEL_ID, DEFAULT_CHANNEL_ID]);
         });
 
-        it('throws when the seller channel cannot be loaded', async () => {
-            const order = createAggregateOrder();
-            orderSellerStrategy.splitOrder.mockResolvedValue(splitInto(order, 999));
+        it('assigns only the default Channel when the partial order belongs to it', async () => {
+            splitInto({ channelId: DEFAULT_CHANNEL_ID });
 
-            await expect(orderSplitter.createSellerOrders(ctx, order)).rejects.toBeInstanceOf(
-                InternalServerError,
+            await orderSplitter.createSellerOrders(ctx, order);
+
+            expect(savedOrders[0].channels).toEqual([defaultChannel]);
+        });
+    });
+
+    describe('OrderLine duplication', () => {
+        it('copies the price and quantity data onto a new OrderLine', async () => {
+            const line = createOrderLine('T_20');
+            splitInto({ lines: [line] });
+
+            await orderSplitter.createSellerOrders(ctx, order);
+
+            expect(savedOrderLines.length).toBe(1);
+            const [newLine] = savedOrderLines;
+            expect(newLine).not.toBe(line);
+            expect(newLine.quantity).toBe(line.quantity);
+            expect(newLine.orderPlacedQuantity).toBe(line.orderPlacedQuantity);
+            expect(newLine.productVariantId).toBe(line.productVariantId);
+            expect(newLine.listPrice).toBe(line.listPrice);
+            expect(newLine.listPriceIncludesTax).toBe(line.listPriceIncludesTax);
+            expect(newLine.initialListPrice).toBe(line.initialListPrice);
+            expect(newLine.taxLines).toEqual(line.taxLines);
+            expect(savedOrders[0].lines).toEqual(savedOrderLines);
+        });
+
+        it('does not carry over the source OrderLine id', async () => {
+            const line = createOrderLine('T_20');
+            splitInto({ lines: [line] });
+
+            await orderSplitter.createSellerOrders(ctx, order);
+
+            expect(savedOrderLines[0].id).not.toBe('T_20');
+        });
+    });
+
+    describe('ShippingLine duplication', () => {
+        it('duplicates the ShippingLine and repoints the matching OrderLines at the copy', async () => {
+            const shippingLine = createShippingLine('T_30');
+            const matchingLine = createOrderLine('T_20', { shippingLineId: 'T_30' } as any);
+            const otherLine = createOrderLine('T_21', { shippingLineId: 'T_31' } as any);
+            splitInto({ lines: [matchingLine, otherLine], shippingLines: [shippingLine] });
+
+            await orderSplitter.createSellerOrders(ctx, order);
+
+            const newShippingLine = savedShippingLines[0];
+            expect(newShippingLine.shippingMethodId).toBe(shippingLine.shippingMethodId);
+            expect(newShippingLine.listPrice).toBe(shippingLine.listPrice);
+            expect(newShippingLine.id).not.toBe('T_30');
+
+            const [newMatchingLine, newOtherLine] = savedOrderLines;
+            expect(newMatchingLine.shippingLineId).toBe(newShippingLine.id);
+            expect(newOtherLine.shippingLineId).toBe('T_31');
+            expect(savedOrders[0].shippingLines).toEqual([newShippingLine]);
+        });
+
+        it('re-saves only the OrderLines whose ShippingLine changed', async () => {
+            const shippingLine = createShippingLine('T_30');
+            const matchingLine = createOrderLine('T_20', { shippingLineId: 'T_30' } as any);
+            const otherLine = createOrderLine('T_21', { shippingLineId: 'T_31' } as any);
+            splitInto({ lines: [matchingLine, otherLine], shippingLines: [shippingLine] });
+
+            await orderSplitter.createSellerOrders(ctx, order);
+
+            const orderLineRepository = getRepository(ctx, OrderLine);
+            // two lines duplicated, plus one re-save for the line which was repointed
+            expect(orderLineRepository.save).toHaveBeenCalledTimes(3);
+        });
+    });
+
+    describe('price adjustments', () => {
+        it('applies price adjustments in a context scoped to the seller Channel', async () => {
+            splitInto({ channelId: SELLER_CHANNEL_ID });
+
+            await orderSplitter.createSellerOrders(ctx, order);
+
+            const [sellerCtx] = applyPriceAdjustments.mock.calls[0];
+            expect(sellerCtx).toBeInstanceOf(RequestContext);
+            expect(sellerCtx).not.toBe(ctx);
+            expect(sellerCtx.channel).toBe(sellerChannel);
+        });
+
+        it('keeps the customer language and currency of the original context', async () => {
+            splitInto({ channelId: SELLER_CHANNEL_ID });
+
+            await orderSplitter.createSellerOrders(ctx, order);
+
+            const [sellerCtx] = applyPriceAdjustments.mock.calls[0];
+            expect(sellerCtx.languageCode).toBe(LanguageCode.de);
+            expect(sellerCtx.currencyCode).toBe(CurrencyCode.GBP);
+            expect(sellerCtx.session).toBe(ctx.session);
+        });
+
+        it('recalculates shipping promotions but not shipping prices', async () => {
+            splitInto({});
+
+            await orderSplitter.createSellerOrders(ctx, order);
+
+            expect(applyPriceAdjustments).toHaveBeenCalledWith(
+                expect.any(RequestContext),
+                savedOrders[0],
+                undefined,
+                undefined,
+                { recalculateShipping: false, recalculateShippingPromotions: true },
             );
-            expect(orderService.applyPriceAdjustments).not.toHaveBeenCalled();
+        });
+
+        it('throws when the seller Channel cannot be loaded', async () => {
+            splitInto({ channelId: 'T_999' });
+
+            await expect(orderSplitter.createSellerOrders(ctx, order)).rejects.toThrow(InternalServerError);
+            expect(applyPriceAdjustments).not.toHaveBeenCalled();
         });
     });
 });

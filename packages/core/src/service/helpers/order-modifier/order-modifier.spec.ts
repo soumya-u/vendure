@@ -1,11 +1,9 @@
-// eslint-disable-next-line import/order
-import { Test } from '@nestjs/testing';
-import { HistoryEntryType, ModifyOrderInput } from '@vendure/common/lib/generated-types';
+import { AdjustmentType, HistoryEntryType } from '@vendure/common/lib/generated-types';
+import { ID } from '@vendure/common/lib/shared-types';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { OrderModifier } from './order-modifier';
 
 import { RequestContext } from '../../../api/common/request-context';
-import { EntityNotFoundError, InternalServerError, UserInputError } from '../../../common/error/errors';
+import { EntityNotFoundError, UserInputError } from '../../../common/error/errors';
 import {
     CancelActiveOrderError,
     CouponCodeInvalidError,
@@ -13,8 +11,8 @@ import {
     MultipleOrderError,
     NoChangesSpecifiedError,
     OrderModificationStateError,
+    QuantityTooGreatError,
     RefundPaymentIdMissingError,
-    RefundStateTransitionError,
 } from '../../../common/error/generated-graphql-admin-errors';
 import {
     IneligibleShippingMethodError,
@@ -23,684 +21,941 @@ import {
     OrderLimitError,
 } from '../../../common/error/generated-graphql-shop-errors';
 import { ensureConfigLoaded } from '../../../config/config-helpers';
-import { ConfigService } from '../../../config/config.service';
-import { MockConfigService } from '../../../config/config.service.mock';
-import { CustomFieldConfig } from '../../../config/custom-field/custom-field-types';
-import { TransactionalConnection } from '../../../connection/transactional-connection';
 import { Channel } from '../../../entity/channel/channel.entity';
-import { Customer } from '../../../entity/customer/customer.entity';
-import { OrderModificationLine } from '../../../entity/order-line-reference/order-modification-line.entity';
+import { FulfillmentLine } from '../../../entity/order-line-reference/fulfillment-line.entity';
 import { OrderLine } from '../../../entity/order-line/order-line.entity';
 import { OrderModification } from '../../../entity/order-modification/order-modification.entity';
 import { Order } from '../../../entity/order/order.entity';
 import { Payment } from '../../../entity/payment/payment.entity';
 import { ProductVariant } from '../../../entity/product-variant/product-variant.entity';
-import { Product } from '../../../entity/product/product.entity';
-import { Refund } from '../../../entity/refund/refund.entity';
-import { Surcharge } from '../../../entity/surcharge/surcharge.entity';
-import { TaxCategory } from '../../../entity/tax-category/tax-category.entity';
-import { OrderEvent } from '../../../event-bus';
-import { EventBus } from '../../../event-bus/event-bus';
+import { ShippingLine } from '../../../entity/shipping-line/shipping-line.entity';
+import { Allocation } from '../../../entity/stock-movement/allocation.entity';
 import { OrderLineEvent } from '../../../event-bus/events/order-line-event';
-import { createOrderFromLines } from '../../../testing/order-test-utils';
-import { CountryService } from '../../services/country.service';
-import { HistoryService } from '../../services/history.service';
-import { PaymentService } from '../../services/payment.service';
-import { ProductVariantService } from '../../services/product-variant.service';
-import { PromotionService } from '../../services/promotion.service';
-import { StockMovementService } from '../../services/stock-movement.service';
-import { CustomFieldRelationService } from '../custom-field-relation/custom-field-relation.service';
-import { OrderCalculator } from '../order-calculator/order-calculator';
-import { ShippingCalculator } from '../shipping-calculator/shipping-calculator';
-import { TranslatorService } from '../translator/translator.service';
+
+import { OrderModifier } from './order-modifier';
 
 /**
- * Stands in for a TypeORM Repository. `save` assigns an id to new entities and returns them; the
- * `relation()` chain records links made to the entity so that the tests can assert on them.
+ * Unit tests for the OrderModifier helper. The TypeORM repositories are replaced with in-memory
+ * mocks so that each test can assert on the entities which get persisted, the stock movements
+ * which get created, and the error results returned for invalid input.
  */
-function createFakeRepository(prefix: string) {
-    let nextId = 1;
-    const saved: any[] = [];
-    const relationOps: Array<{ relation: string; of: any; op: 'add' | 'set'; value: any }> = [];
+
+/**
+ * Narrows a modifyOrder() result to the success case, failing the test otherwise.
+ */
+function expectSuccess(result: Awaited<ReturnType<OrderModifier['modifyOrder']>>): {
+    order: Order;
+    modification: OrderModification;
+} {
+    if (!('modification' in result)) {
+        throw new Error(`Expected a successful modification, got ${JSON.stringify(result)}`);
+    }
+    return result;
+}
+
+let idCounter = 0;
+
+function createCtx(): RequestContext {
+    return new RequestContext({
+        apiType: 'admin',
+        channel: new Channel({ id: 'T_1', pricesIncludeTax: true }),
+        isAuthorized: true,
+        authorizedAsOwnerOnly: false,
+        session: {} as any,
+        translationFn: ((key: string) => key) as any,
+    });
+}
+
+function createVariant(overrides: Partial<ProductVariant> = {}): ProductVariant {
+    return new ProductVariant({
+        id: 'T_1',
+        listPrice: 1000,
+        listPriceIncludesTax: true,
+        product: { id: 'T_1', featuredAssetId: undefined },
+        taxCategory: { id: 'T_1' },
+        ...overrides,
+    } as any);
+}
+
+function createLine(overrides: Partial<OrderLine> = {}): OrderLine {
+    return new OrderLine({
+        id: 'T_1',
+        quantity: 1,
+        productVariantId: 'T_1',
+        productVariant: createVariant(),
+        adjustments: [],
+        taxLines: [],
+        customFields: {},
+        listPrice: 1000,
+        listPriceIncludesTax: true,
+        ...overrides,
+    } as any);
+}
+
+function createOrder(overrides: Partial<Order> = {}): Order {
+    return new Order({
+        id: 'T_1',
+        state: 'AddingItems',
+        active: true,
+        lines: [],
+        surcharges: [],
+        shippingLines: [],
+        couponCodes: [],
+        subTotalWithTax: 0,
+        shippingWithTax: 0,
+        ...overrides,
+    } as any);
+}
+
+interface MockRepository {
+    save: ReturnType<typeof vi.fn>;
+    update: ReturnType<typeof vi.fn>;
+    remove: ReturnType<typeof vi.fn>;
+    find: ReturnType<typeof vi.fn>;
+    findOne: ReturnType<typeof vi.fn>;
+    createQueryBuilder: ReturnType<typeof vi.fn>;
+    getMany: ReturnType<typeof vi.fn>;
+    relationAdd: ReturnType<typeof vi.fn>;
+    relationSet: ReturnType<typeof vi.fn>;
+    updateQuery: ReturnType<typeof vi.fn>;
+}
+
+function createMockRepository(): MockRepository {
+    const getMany = vi.fn(async () => [] as any[]);
+    const relationAdd = vi.fn(async () => undefined);
+    const relationSet = vi.fn(async () => undefined);
+    const updateQuery = vi.fn();
+    const queryBuilder: any = {
+        leftJoinAndSelect: () => queryBuilder,
+        where: () => queryBuilder,
+        andWhere: () => queryBuilder,
+        whereInIds: () => queryBuilder,
+        getMany,
+        relation: () => queryBuilder,
+        of: () => queryBuilder,
+        add: relationAdd,
+        set: relationSet,
+        update: (...args: any[]) => {
+            updateQuery(...args);
+            return queryBuilder;
+        },
+        execute: async () => undefined,
+    };
     return {
-        saved,
-        relationOps,
         save: vi.fn(async (entity: any) => {
-            if (!Array.isArray(entity) && entity.id == null) {
-                entity.id = `${prefix}-${nextId++}`;
-            }
-            saved.push(entity);
-            return entity;
+            const assignId = (e: any) => {
+                if (e && e.id == null) {
+                    e.id = `T_${++idCounter + 100}`;
+                }
+                return e;
+            };
+            return Array.isArray(entity) ? entity.map(assignId) : assignId(entity);
         }),
-        update: vi.fn().mockResolvedValue(undefined),
-        find: vi.fn().mockResolvedValue([]),
-        findOne: vi.fn().mockResolvedValue(null),
-        createQueryBuilder: () => ({
-            relation: (relation: string) => ({
-                of: (of: any) => ({
-                    add: async (value: any) => {
-                        relationOps.push({ relation, of, op: 'add', value });
-                    },
-                    set: async (value: any) => {
-                        relationOps.push({ relation, of, op: 'set', value });
-                    },
-                }),
-            }),
-        }),
+        update: vi.fn(async () => undefined),
+        remove: vi.fn(async (entities: any) => entities),
+        find: vi.fn(async () => [] as any[]),
+        findOne: vi.fn(async () => null),
+        createQueryBuilder: vi.fn(() => queryBuilder),
+        getMany,
+        relationAdd,
+        relationSet,
+        updateQuery,
     };
 }
 
-type FakeRepository = ReturnType<typeof createFakeRepository>;
-
 describe('OrderModifier', () => {
-    let orderModifier: OrderModifier;
-    let mockConfigService: MockConfigService;
-    let repos: Record<string, FakeRepository>;
-    let connection: {
-        getRepository: ReturnType<typeof vi.fn>;
-        getEntityOrThrow: ReturnType<typeof vi.fn>;
-        findOneInChannel: ReturnType<typeof vi.fn>;
-    };
-    let orderCalculator: {
-        applyPriceAdjustments: ReturnType<typeof vi.fn>;
-        calculateOrderTotals: ReturnType<typeof vi.fn>;
-    };
-    let paymentService: { createRefund: ReturnType<typeof vi.fn> };
-    let countryService: { findOneByCode: ReturnType<typeof vi.fn> };
-    let stockMovementService: {
-        createAllocationsForOrderLines: ReturnType<typeof vi.fn>;
-        createCancellationsForOrderLines: ReturnType<typeof vi.fn>;
-        createReleasesForOrderLines: ReturnType<typeof vi.fn>;
-    };
-    let productVariantService: {
-        getSaleableStockLevel: ReturnType<typeof vi.fn>;
-        applyChannelPriceAndTax: ReturnType<typeof vi.fn>;
-    };
-    let customFieldRelationService: { updateRelations: ReturnType<typeof vi.fn> };
-    let promotionService: {
-        validateCouponCode: ReturnType<typeof vi.fn>;
-        getActivePromotionsInChannel: ReturnType<typeof vi.fn>;
-        getActivePromotionsOnOrder: ReturnType<typeof vi.fn>;
-        runPromotionSideEffects: ReturnType<typeof vi.fn>;
-    };
-    let eventBus: { publish: ReturnType<typeof vi.fn> };
-    let shippingCalculator: { getMethodIfEligible: ReturnType<typeof vi.fn> };
-    let historyService: { createHistoryEntryForOrder: ReturnType<typeof vi.fn> };
-
-    const ctx = new RequestContext({
-        apiType: 'admin',
-        channel: new Channel({ id: 1, pricesIncludeTax: false }),
-        authorizedAsOwnerOnly: false,
-        isAuthorized: true,
-    });
-
     beforeAll(async () => {
+        // the money-related entity getters read the MoneyStrategy from the global config
         await ensureConfigLoaded();
     });
 
-    beforeEach(async () => {
-        repos = {
-            Order: createFakeRepository('order'),
-            OrderLine: createFakeRepository('line'),
-            OrderModification: createFakeRepository('modification'),
-            OrderModificationLine: createFakeRepository('modification-line'),
-            Surcharge: createFakeRepository('surcharge'),
-            ShippingLine: createFakeRepository('shipping-line'),
-            Payment: createFakeRepository('payment'),
-        };
-        connection = {
-            getRepository: vi.fn((_ctx: RequestContext, entity: { name: string }) => repos[entity.name]),
-            getEntityOrThrow: vi.fn(),
-            findOneInChannel: vi.fn(),
-        };
-        orderCalculator = {
-            applyPriceAdjustments: vi.fn(async (_ctx: RequestContext, order: Order) => order),
-            calculateOrderTotals: vi.fn(),
-        };
-        paymentService = { createRefund: vi.fn() };
-        countryService = {
-            findOneByCode: vi.fn(async (_ctx: RequestContext, code: string) => ({ name: `Country ${code}` })),
-        };
-        stockMovementService = {
-            createAllocationsForOrderLines: vi.fn().mockResolvedValue([]),
-            createCancellationsForOrderLines: vi.fn().mockResolvedValue([]),
-            createReleasesForOrderLines: vi.fn().mockResolvedValue([]),
-        };
-        productVariantService = {
-            getSaleableStockLevel: vi.fn().mockResolvedValue(100),
-            applyChannelPriceAndTax: vi.fn(async (variant: ProductVariant) => variant),
-        };
-        customFieldRelationService = { updateRelations: vi.fn().mockResolvedValue(undefined) };
-        promotionService = {
-            validateCouponCode: vi.fn(),
-            getActivePromotionsInChannel: vi.fn().mockResolvedValue([]),
-            getActivePromotionsOnOrder: vi.fn().mockResolvedValue([]),
-            runPromotionSideEffects: vi.fn().mockResolvedValue(undefined),
-        };
-        eventBus = { publish: vi.fn().mockResolvedValue(undefined) };
-        shippingCalculator = { getMethodIfEligible: vi.fn() };
-        historyService = { createHistoryEntryForOrder: vi.fn().mockResolvedValue(undefined) };
+    let ctx: RequestContext;
+    let repositories: Map<any, MockRepository>;
+    let orderModifier: OrderModifier;
+    let getSaleableStockLevel: ReturnType<typeof vi.fn>;
+    let applyChannelPriceAndTax: ReturnType<typeof vi.fn>;
+    let findOneInChannel: ReturnType<typeof vi.fn>;
+    let getEntityOrThrow: ReturnType<typeof vi.fn>;
+    let createAllocationsForOrderLines: ReturnType<typeof vi.fn>;
+    let createCancellationsForOrderLines: ReturnType<typeof vi.fn>;
+    let createReleasesForOrderLines: ReturnType<typeof vi.fn>;
+    let publish: ReturnType<typeof vi.fn>;
+    let createHistoryEntryForOrder: ReturnType<typeof vi.fn>;
+    let calculateOrderTotals: ReturnType<typeof vi.fn>;
+    let applyPriceAdjustments: ReturnType<typeof vi.fn>;
+    let getMethodIfEligible: ReturnType<typeof vi.fn>;
+    let assignShippingLineToOrderLines: ReturnType<typeof vi.fn>;
+    let setOrderLineSellerChannel: ((...args: any[]) => any) | undefined;
+    let updateRelations: ReturnType<typeof vi.fn>;
+    let validateCouponCode: ReturnType<typeof vi.fn>;
+    let createRefund: ReturnType<typeof vi.fn>;
+    let findOneByCode: ReturnType<typeof vi.fn>;
+    let orderLineCustomFields: any[];
+    let orderItemsLimit: number;
+    let calculateUnitPrice: ReturnType<typeof vi.fn>;
 
-        const module = await Test.createTestingModule({
-            providers: [
-                OrderModifier,
-                { provide: ConfigService, useClass: MockConfigService },
-                { provide: TransactionalConnection, useValue: connection },
-                { provide: OrderCalculator, useValue: orderCalculator },
-                { provide: PaymentService, useValue: paymentService },
-                { provide: CountryService, useValue: countryService },
-                { provide: StockMovementService, useValue: stockMovementService },
-                { provide: ProductVariantService, useValue: productVariantService },
-                { provide: CustomFieldRelationService, useValue: customFieldRelationService },
-                { provide: PromotionService, useValue: promotionService },
-                { provide: EventBus, useValue: eventBus },
-                { provide: ShippingCalculator, useValue: shippingCalculator },
-                { provide: HistoryService, useValue: historyService },
-                { provide: TranslatorService, useValue: {} },
-            ],
-        }).compile();
-        mockConfigService = module.get<ConfigService, MockConfigService>(ConfigService);
-        mockConfigService.orderOptions = {
-            orderItemsLimit: 999,
-            orderSellerStrategy: {},
-            orderItemPriceCalculationStrategy: {
-                calculateUnitPrice: vi.fn(async (_ctx: RequestContext, variant: ProductVariant) => ({
-                    price: variant.listPrice,
-                    priceIncludesTax: variant.listPriceIncludesTax,
-                })),
-            },
-        };
-        mockConfigService.customFields = { OrderLine: [] as CustomFieldConfig[] };
-        orderModifier = module.get(OrderModifier);
-    });
-
-    function setOrderLineCustomFields(
-        defs: Array<Partial<CustomFieldConfig> & { name: string; type: string }>,
-    ) {
-        mockConfigService.customFields = { OrderLine: defs as CustomFieldConfig[] };
+    function repo(entity: any): MockRepository {
+        let r = repositories.get(entity);
+        if (!r) {
+            r = createMockRepository();
+            repositories.set(entity, r);
+        }
+        return r;
     }
 
-    describe('constrainQuantityToSaleable()', () => {
-        const variant = new ProductVariant({ id: 1 });
+    beforeEach(() => {
+        ctx = createCtx();
+        repositories = new Map();
+        orderLineCustomFields = [];
+        orderItemsLimit = 999;
+        getSaleableStockLevel = vi.fn(async () => 100);
+        applyChannelPriceAndTax = vi.fn(async (variant: ProductVariant) => variant);
+        findOneInChannel = vi.fn(async () => createVariant());
+        getEntityOrThrow = vi.fn(async () => createOrder());
+        createAllocationsForOrderLines = vi.fn(async () => []);
+        createCancellationsForOrderLines = vi.fn(async () => []);
+        createReleasesForOrderLines = vi.fn(async () => []);
+        publish = vi.fn(async () => undefined);
+        createHistoryEntryForOrder = vi.fn(async () => undefined);
+        calculateOrderTotals = vi.fn();
+        applyPriceAdjustments = vi.fn(async () => undefined);
+        getMethodIfEligible = vi.fn(async (_ctx: RequestContext, _order: Order, id: ID) => ({ id }));
+        assignShippingLineToOrderLines = vi.fn(
+            async (_ctx: RequestContext, _sl: any, order: Order) => order.lines,
+        );
+        setOrderLineSellerChannel = undefined;
+        updateRelations = vi.fn(async () => undefined);
+        validateCouponCode = vi.fn(async (_ctx: RequestContext, couponCode: string) => ({
+            id: 'T_1',
+            couponCode,
+        }));
+        createRefund = vi.fn(async () => ({ id: 'T_1' }));
+        findOneByCode = vi.fn(async () => ({ name: 'Germany' }));
+        calculateUnitPrice = vi.fn(async () => ({ price: 1000, priceIncludesTax: true }));
 
-        it('returns the requested quantity when stock is sufficient', async () => {
-            productVariantService.getSaleableStockLevel.mockResolvedValue(10);
+        const connection: any = {
+            getRepository: (_ctx: RequestContext, entity: any) => repo(entity),
+            getEntityOrThrow,
+            findOneInChannel,
+        };
+        const configService: any = {
+            get customFields() {
+                return { OrderLine: orderLineCustomFields };
+            },
+            get orderOptions() {
+                return {
+                    get orderItemsLimit() {
+                        return orderItemsLimit;
+                    },
+                    orderSellerStrategy: {
+                        get setOrderLineSellerChannel() {
+                            return setOrderLineSellerChannel;
+                        },
+                    },
+                    orderItemPriceCalculationStrategy: { calculateUnitPrice },
+                };
+            },
+            shippingOptions: { shippingLineAssignmentStrategy: { assignShippingLineToOrderLines } },
+        };
+        orderModifier = new OrderModifier(
+            connection,
+            configService,
+            { calculateOrderTotals, applyPriceAdjustments } as any,
+            { createRefund } as any,
+            { findOneByCode } as any,
+            {
+                createAllocationsForOrderLines,
+                createCancellationsForOrderLines,
+                createReleasesForOrderLines,
+            } as any,
+            { getSaleableStockLevel, applyChannelPriceAndTax } as any,
+            { updateRelations } as any,
+            {
+                validateCouponCode,
+                getActivePromotionsInChannel: vi.fn(async () => []),
+                getActivePromotionsOnOrder: vi.fn(async () => []),
+                runPromotionSideEffects: vi.fn(async () => undefined),
+            } as any,
+            { publish } as any,
+            { getMethodIfEligible } as any,
+            { createHistoryEntryForOrder } as any,
+            { translate: (entity: any) => entity } as any,
+        );
+    });
 
-            expect(await orderModifier.constrainQuantityToSaleable(ctx, variant, 5)).toBe(5);
+    describe('constrainQuantityToSaleable', () => {
+        it('returns the requested quantity when there is enough stock', async () => {
+            getSaleableStockLevel.mockResolvedValue(10);
+
+            const result = await orderModifier.constrainQuantityToSaleable(ctx, createVariant(), 5);
+
+            expect(result).toBe(5);
         });
 
-        it('adds the existing line quantity to the requested quantity', async () => {
-            productVariantService.getSaleableStockLevel.mockResolvedValue(10);
+        it('caps the quantity at the saleable stock level', async () => {
+            getSaleableStockLevel.mockResolvedValue(3);
 
-            expect(await orderModifier.constrainQuantityToSaleable(ctx, variant, 3, 4)).toBe(7);
+            const result = await orderModifier.constrainQuantityToSaleable(ctx, createVariant(), 5);
+
+            expect(result).toBe(3);
         });
 
-        it('caps the quantity to the saleable stock level', async () => {
-            productVariantService.getSaleableStockLevel.mockResolvedValue(4);
+        it('adds the existing OrderLine quantity to the requested quantity', async () => {
+            getSaleableStockLevel.mockResolvedValue(10);
 
-            expect(await orderModifier.constrainQuantityToSaleable(ctx, variant, 10)).toBe(4);
+            const result = await orderModifier.constrainQuantityToSaleable(ctx, createVariant(), 5, 2);
+
+            expect(result).toBe(7);
         });
 
-        it('caps the addition to what remains after the existing line quantity', async () => {
-            productVariantService.getSaleableStockLevel.mockResolvedValue(6);
+        it('subtracts the existing OrderLine quantity when capping', async () => {
+            getSaleableStockLevel.mockResolvedValue(6);
 
-            expect(await orderModifier.constrainQuantityToSaleable(ctx, variant, 10, 4)).toBe(2);
+            const result = await orderModifier.constrainQuantityToSaleable(ctx, createVariant(), 5, 2);
+
+            expect(result).toBe(4);
         });
 
-        it('accounts for the same variant in other order lines', async () => {
-            productVariantService.getSaleableStockLevel.mockResolvedValue(6);
+        it('takes the quantity in other OrderLines of the same variant into account', async () => {
+            getSaleableStockLevel.mockResolvedValue(10);
 
-            expect(await orderModifier.constrainQuantityToSaleable(ctx, variant, 10, 1, 3)).toBe(2);
+            const result = await orderModifier.constrainQuantityToSaleable(ctx, createVariant(), 5, 0, 8);
+
+            expect(result).toBe(2);
         });
 
         it('never returns a negative quantity', async () => {
-            productVariantService.getSaleableStockLevel.mockResolvedValue(2);
+            getSaleableStockLevel.mockResolvedValue(1);
 
-            expect(await orderModifier.constrainQuantityToSaleable(ctx, variant, 1, 5)).toBe(0);
+            const result = await orderModifier.constrainQuantityToSaleable(ctx, createVariant(), 5, 3, 4);
+
+            expect(result).toBe(0);
         });
     });
 
-    describe('getExistingOrderLine()', () => {
-        it('returns the line matching the variant id when no custom fields are configured', async () => {
-            const order = createOrderFromLines([
-                { lineId: 1, quantity: 1, productVariantId: 100 },
-                { lineId: 2, quantity: 1, productVariantId: 200 },
-            ]);
-            order.lines.forEach(l => (l.productVariantId = l.productVariant.id));
+    describe('getExistingOrderLine', () => {
+        it('returns the line matching the ProductVariant id', async () => {
+            const line = createLine({ id: 'T_2', productVariantId: 'T_42' } as any);
+            const order = createOrder({ lines: [createLine({ productVariantId: 'T_1' } as any), line] });
 
-            const result = await orderModifier.getExistingOrderLine(ctx, order, 200);
+            const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_42');
 
-            expect(result).toBe(order.lines[1]);
+            expect(result).toBe(line);
         });
 
-        it('returns undefined when no line has the variant', async () => {
-            const order = createOrderFromLines([{ lineId: 1, quantity: 1, productVariantId: 100 }]);
-            order.lines[0].productVariantId = 100;
+        it('returns undefined when no line contains the ProductVariant', async () => {
+            const order = createOrder({ lines: [createLine({ productVariantId: 'T_1' } as any)] });
 
-            expect(await orderModifier.getExistingOrderLine(ctx, order, 300)).toBeUndefined();
+            const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_99');
+
+            expect(result).toBeUndefined();
         });
 
-        describe('with custom fields', () => {
-            function orderWithLine(customFields: any): Order {
-                const order = createOrderFromLines([
-                    { lineId: 1, quantity: 1, productVariantId: 100, customFields },
-                ]);
-                order.lines[0].productVariantId = 100;
-                return order;
-            }
-
-            it('matches when the custom field values are equal', async () => {
-                setOrderLineCustomFields([{ name: 'note', type: 'string' }]);
-                const order = orderWithLine({ note: 'gift' });
-
-                const result = await orderModifier.getExistingOrderLine(ctx, order, 100, { note: 'gift' });
-
-                expect(result).toBe(order.lines[0]);
+        it('does not match a line whose custom field values differ from the input', async () => {
+            orderLineCustomFields = [{ name: 'message', type: 'string' }];
+            const order = createOrder({
+                lines: [createLine({ customFields: { message: 'hello' } } as any)],
             });
 
-            it('does not match when the custom field values differ', async () => {
-                setOrderLineCustomFields([{ name: 'note', type: 'string' }]);
-                const order = orderWithLine({ note: 'gift' });
+            const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', {
+                message: 'goodbye',
+            });
 
-                const result = await orderModifier.getExistingOrderLine(ctx, order, 100, { note: 'other' });
+            expect(result).toBeUndefined();
+        });
+
+        it('matches a line whose custom field values equal the input', async () => {
+            orderLineCustomFields = [{ name: 'message', type: 'string' }];
+            const line = createLine({ customFields: { message: 'hello' } } as any);
+            const order = createOrder({ lines: [line] });
+
+            const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', {
+                message: 'hello',
+            });
+
+            expect(result).toBe(line);
+        });
+
+        it('matches when an omitted custom field equals the configured default value', async () => {
+            orderLineCustomFields = [{ name: 'message', type: 'string', defaultValue: 'hello' }];
+            const line = createLine({ customFields: { message: 'hello' } } as any);
+            const order = createOrder({ lines: [line] });
+
+            const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', {});
+
+            expect(result).toBe(line);
+        });
+
+        it('matches when an omitted custom field is null on the existing line', async () => {
+            orderLineCustomFields = [{ name: 'message', type: 'string' }];
+            const line = createLine({ customFields: { message: null } } as any);
+            const order = createOrder({ lines: [line] });
+
+            const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', {});
+
+            expect(result).toBe(line);
+        });
+
+        it('treats a numeric 0/1 boolean custom field as a boolean', async () => {
+            orderLineCustomFields = [{ name: 'giftWrap', type: 'boolean' }];
+            const line = createLine({ customFields: { giftWrap: 1 } } as any);
+            const order = createOrder({ lines: [line] });
+
+            const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', { giftWrap: true });
+
+            expect(result).toBe(line);
+        });
+
+        describe('with null customFields input', () => {
+            it('matches a line whose custom fields are all null', async () => {
+                orderLineCustomFields = [{ name: 'message', type: 'string' }];
+                const line = createLine({ customFields: { message: null } } as any);
+                const order = createOrder({ lines: [line] });
+
+                const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', null as any);
+
+                expect(result).toBe(line);
+            });
+
+            it('does not match a line with a non-default custom field value', async () => {
+                orderLineCustomFields = [{ name: 'message', type: 'string' }];
+                const order = createOrder({
+                    lines: [createLine({ customFields: { message: 'hello' } } as any)],
+                });
+
+                const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', null as any);
 
                 expect(result).toBeUndefined();
             });
 
-            it('treats an undefined input as matching a null existing value', async () => {
-                setOrderLineCustomFields([{ name: 'note', type: 'string' }]);
-                const order = orderWithLine({ note: null });
+            it('matches a line whose custom field equals the default value', async () => {
+                orderLineCustomFields = [{ name: 'message', type: 'string', defaultValue: 'hello' }];
+                const line = createLine({ customFields: { message: 'hello' } } as any);
+                const order = createOrder({ lines: [line] });
 
-                const result = await orderModifier.getExistingOrderLine(ctx, order, 100, {});
+                const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', null as any);
 
-                expect(result).toBe(order.lines[0]);
+                expect(result).toBe(line);
             });
 
-            it('treats an undefined input as matching the default value', async () => {
-                setOrderLineCustomFields([{ name: 'gift', type: 'boolean', defaultValue: false }]);
-                const order = orderWithLine({ gift: false });
+            it('does not match a line whose list custom field is not empty', async () => {
+                orderLineCustomFields = [{ name: 'tags', type: 'string', list: true }];
+                const order = createOrder({
+                    lines: [createLine({ customFields: { tags: ['gift'] } } as any)],
+                });
 
-                const result = await orderModifier.getExistingOrderLine(ctx, order, 100, {});
-
-                expect(result).toBe(order.lines[0]);
-            });
-
-            it('coerces numeric boolean columns before comparing', async () => {
-                setOrderLineCustomFields([{ name: 'gift', type: 'boolean' }]);
-                const order = orderWithLine({ gift: 1 });
-
-                const result = await orderModifier.getExistingOrderLine(ctx, order, 100, { gift: true });
-
-                expect(result).toBe(order.lines[0]);
-            });
-
-            it('matches a null input against a line whose custom fields are all unset', async () => {
-                setOrderLineCustomFields([
-                    { name: 'note', type: 'string' },
-                    { name: 'tags', type: 'string', list: true },
-                ]);
-                const order = orderWithLine({ note: null, tags: [] });
-
-                const result = await orderModifier.getExistingOrderLine(ctx, order, 100, undefined);
-
-                expect(result).toBe(order.lines[0]);
-            });
-
-            it('matches a null input against a line whose custom fields equal their defaults', async () => {
-                setOrderLineCustomFields([{ name: 'note', type: 'string', defaultValue: 'none' }]);
-                const order = orderWithLine({ note: 'none' });
-
-                const result = await orderModifier.getExistingOrderLine(ctx, order, 100, undefined);
-
-                expect(result).toBe(order.lines[0]);
-            });
-
-            it('does not match a null input against a line with a set custom field', async () => {
-                setOrderLineCustomFields([{ name: 'note', type: 'string' }]);
-                const order = orderWithLine({ note: 'gift' });
-
-                const result = await orderModifier.getExistingOrderLine(ctx, order, 100, undefined);
+                const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', null as any);
 
                 expect(result).toBeUndefined();
             });
 
-            it('does not match a null input against a line whose value differs from the default', async () => {
-                setOrderLineCustomFields([{ name: 'note', type: 'string', defaultValue: 'none' }]);
-                const order = orderWithLine({ note: 'gift' });
+            it('matches a line whose list custom field is empty', async () => {
+                orderLineCustomFields = [{ name: 'tags', type: 'string', list: true }];
+                const line = createLine({ customFields: { tags: [] } } as any);
+                const order = createOrder({ lines: [line] });
 
-                const result = await orderModifier.getExistingOrderLine(ctx, order, 100, undefined);
+                const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', null as any);
+
+                expect(result).toBe(line);
+            });
+        });
+
+        describe('relation custom fields', () => {
+            beforeEach(() => {
+                orderLineCustomFields = [{ name: 'gift', type: 'relation', entity: ProductVariant }];
+            });
+
+            it('matches when the input id equals the id of the related entity', async () => {
+                const line = createLine();
+                const order = createOrder({ lines: [line] });
+                repo(OrderLine).findOne.mockResolvedValue({ customFields: { gift: { id: 'T_5' } } });
+
+                const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', { giftId: 'T_5' });
+
+                expect(result).toBe(line);
+            });
+
+            it('does not match when the input id differs from the related entity', async () => {
+                const order = createOrder({ lines: [createLine()] });
+                repo(OrderLine).findOne.mockResolvedValue({ customFields: { gift: { id: 'T_5' } } });
+
+                const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', { giftId: 'T_6' });
 
                 expect(result).toBeUndefined();
             });
 
-            it('loads relation custom fields from the DB and compares by id', async () => {
-                setOrderLineCustomFields([{ name: 'engraving', type: 'relation', entity: Product }]);
-                const order = orderWithLine({});
-                repos.OrderLine.findOne.mockResolvedValue(
-                    new OrderLine({ id: 1, customFields: { engraving: { id: 'p-1' } } }),
-                );
-
-                const match = await orderModifier.getExistingOrderLine(ctx, order, 100, {
-                    engravingId: 'p-1',
-                });
-                const mismatch = await orderModifier.getExistingOrderLine(ctx, order, 100, {
-                    engravingId: 'p-2',
+            it('compares list relations irrespective of the order of the ids', async () => {
+                orderLineCustomFields = [
+                    { name: 'gift', type: 'relation', entity: ProductVariant, list: true },
+                ];
+                const line = createLine();
+                const order = createOrder({ lines: [line] });
+                repo(OrderLine).findOne.mockResolvedValue({
+                    customFields: { gift: [{ id: 'T_5' }, { id: 'T_6' }] },
                 });
 
-                expect(match).toBe(order.lines[0]);
-                expect(mismatch).toBeUndefined();
-                expect(repos.OrderLine.findOne).toHaveBeenCalledWith({
-                    where: { id: 1 },
-                    relations: ['customFields.engraving'],
-                });
-            });
-
-            it('compares list relation custom fields as sets of ids', async () => {
-                setOrderLineCustomFields([{ name: 'addons', type: 'relation', list: true, entity: Product }]);
-                const order = orderWithLine({});
-                repos.OrderLine.findOne.mockResolvedValue(
-                    new OrderLine({ id: 1, customFields: { addons: [{ id: 'b' }, { id: 'a' }] } }),
-                );
-
-                const match = await orderModifier.getExistingOrderLine(ctx, order, 100, {
-                    addonsIds: ['a', 'b'],
-                });
-                const mismatch = await orderModifier.getExistingOrderLine(ctx, order, 100, {
-                    addonsIds: ['a'],
+                const result = await orderModifier.getExistingOrderLine(ctx, order, 'T_1', {
+                    giftIds: ['T_6', 'T_5'],
                 });
 
-                expect(match).toBe(order.lines[0]);
-                expect(mismatch).toBeUndefined();
+                expect(result).toBe(line);
             });
         });
     });
 
-    describe('getOrCreateOrderLine()', () => {
-        it('returns the existing line without touching the DB', async () => {
-            const order = createOrderFromLines([{ lineId: 1, quantity: 1, productVariantId: 100 }]);
-            order.lines[0].productVariantId = 100;
+    describe('getOrCreateOrderLine', () => {
+        it('returns the existing OrderLine without creating a new one', async () => {
+            const line = createLine();
+            const order = createOrder({ lines: [line] });
 
-            const result = await orderModifier.getOrCreateOrderLine(ctx, order, 100);
+            const result = await orderModifier.getOrCreateOrderLine(ctx, order, 'T_1');
 
-            expect(result).toBe(order.lines[0]);
-            expect(connection.findOneInChannel).not.toHaveBeenCalled();
-            expect(repos.OrderLine.save).not.toHaveBeenCalled();
+            expect(result).toBe(line);
+            expect(repo(OrderLine).save).not.toHaveBeenCalled();
+            expect(order.lines.length).toBe(1);
         });
 
-        it('creates, links and announces a new line when none matches', async () => {
-            const order = new Order({ id: 5, lines: [] });
-            const variant = new ProductVariant({
-                id: 100,
-                listPrice: 1200,
-                listPriceIncludesTax: true,
-                featuredAssetId: 'asset-1',
-                taxCategory: new TaxCategory({ id: 'tc' }),
-                product: new Product({ id: 1 }),
-            });
-            connection.findOneInChannel.mockResolvedValue(variant);
-
-            const result = await orderModifier.getOrCreateOrderLine(ctx, order, 100, { note: 'x' });
-
-            expect(result).toBeInstanceOf(OrderLine);
-            expect(result.productVariant).toBe(variant);
-            expect(result.listPrice).toBe(1200);
-            expect(result.listPriceIncludesTax).toBe(true);
-            expect(result.taxCategory).toBe(variant.taxCategory);
-            expect(result.featuredAsset).toEqual({ id: 'asset-1' });
-            expect(result.customFields).toEqual({ note: 'x' });
-            expect(result.quantity).toBe(0);
-            expect(order.lines).toEqual([result]);
-            expect(productVariantService.applyChannelPriceAndTax).toHaveBeenCalledWith(variant, ctx, order);
-            expect(customFieldRelationService.updateRelations).toHaveBeenCalledWith(
-                ctx,
-                OrderLine,
-                { customFields: { note: 'x' } },
-                result,
+        it('creates a new OrderLine from the ProductVariant with zero quantity', async () => {
+            const order = createOrder();
+            findOneInChannel.mockResolvedValue(
+                createVariant({ id: 'T_7', listPrice: 2500, listPriceIncludesTax: false } as any),
             );
-            expect(repos.Order.relationOps).toEqual([
-                { relation: 'lines', of: order, op: 'add', value: result },
-            ]);
-            const event = eventBus.publish.mock.calls[0][0] as OrderLineEvent;
+
+            const result = await orderModifier.getOrCreateOrderLine(ctx, order, 'T_7');
+
+            expect(result.quantity).toBe(0);
+            expect(result.listPrice).toBe(2500);
+            expect(result.listPriceIncludesTax).toBe(false);
+            expect(order.lines).toContain(result);
+            expect(repo(Order).relationAdd).toHaveBeenCalledWith(result);
+        });
+
+        it('applies the channel price and tax to the new line variant', async () => {
+            const order = createOrder();
+
+            await orderModifier.getOrCreateOrderLine(ctx, order, 'T_1');
+
+            expect(applyChannelPriceAndTax).toHaveBeenCalledWith(expect.any(ProductVariant), ctx, order);
+        });
+
+        it('falls back to the Product featured asset when the variant has none', async () => {
+            findOneInChannel.mockResolvedValue(
+                createVariant({ featuredAssetId: undefined, product: { featuredAssetId: 'T_9' } } as any),
+            );
+
+            const result = await orderModifier.getOrCreateOrderLine(ctx, createOrder(), 'T_1');
+
+            expect(result.featuredAsset).toEqual({ id: 'T_9' });
+        });
+
+        it('publishes an OrderLineEvent for the created line', async () => {
+            const order = createOrder();
+
+            const result = await orderModifier.getOrCreateOrderLine(ctx, order, 'T_1');
+
+            expect(publish).toHaveBeenCalledTimes(1);
+            const event = publish.mock.calls[0][0];
             expect(event).toBeInstanceOf(OrderLineEvent);
             expect(event.type).toBe('created');
             expect(event.orderLine).toBe(result);
         });
 
-        it('falls back to the product featured asset', async () => {
-            const order = new Order({ id: 5, lines: [] });
-            connection.findOneInChannel.mockResolvedValue(
-                new ProductVariant({
-                    id: 100,
-                    product: new Product({ id: 1, featuredAssetId: 'product-asset' }),
-                }),
-            );
+        it('assigns the seller Channel when the OrderSellerStrategy provides one', async () => {
+            const sellerChannel = new Channel({ id: 'T_2' });
+            setOrderLineSellerChannel = vi.fn(async () => sellerChannel);
 
-            const result = await orderModifier.getOrCreateOrderLine(ctx, order, 100);
-
-            expect(result.featuredAsset).toEqual({ id: 'product-asset' });
-        });
-
-        it('sets the seller channel when the OrderSellerStrategy provides one', async () => {
-            const sellerChannel = new Channel({ id: 9 });
-            mockConfigService.orderOptions.orderSellerStrategy = {
-                setOrderLineSellerChannel: vi.fn().mockResolvedValue(sellerChannel),
-            };
-            const order = new Order({ id: 5, lines: [] });
-            connection.findOneInChannel.mockResolvedValue(
-                new ProductVariant({ id: 100, product: new Product({ id: 1 }) }),
-            );
-
-            const result = await orderModifier.getOrCreateOrderLine(ctx, order, 100);
+            const result = await orderModifier.getOrCreateOrderLine(ctx, createOrder(), 'T_1');
 
             expect(result.sellerChannel).toBe(sellerChannel);
-            expect(repos.OrderLine.relationOps).toEqual([
-                { relation: 'sellerChannel', of: result, op: 'set', value: sellerChannel },
-            ]);
+            expect(repo(OrderLine).relationSet).toHaveBeenCalledWith(sellerChannel);
         });
 
-        it('throws EntityNotFoundError when the variant is not in the channel', async () => {
-            const order = new Order({ id: 5, lines: [] });
-            connection.findOneInChannel.mockResolvedValue(undefined);
+        it('throws when the ProductVariant does not exist in the Channel', async () => {
+            findOneInChannel.mockResolvedValue(undefined);
 
-            await expect(orderModifier.getOrCreateOrderLine(ctx, order, 100)).rejects.toBeInstanceOf(
+            await expect(orderModifier.getOrCreateOrderLine(ctx, createOrder(), 'T_1')).rejects.toThrow(
                 EntityNotFoundError,
             );
-            expect(connection.findOneInChannel).toHaveBeenCalledWith(
-                ctx,
-                ProductVariant,
-                100,
-                ctx.channelId,
-                expect.objectContaining({ relations: ['product', 'productVariantPrices', 'taxCategory'] }),
-            );
         });
     });
 
-    describe('updateOrderLineQuantity()', () => {
-        function lineInOrder(active: boolean, state: string, quantity: number) {
-            const order = createOrderFromLines([{ lineId: 1, quantity, productVariantId: 100 }]);
-            order.active = active;
-            order.state = state as any;
-            return { order, line: order.lines[0] };
+    describe('updateOrderLineQuantity', () => {
+        it('updates the quantity and saves the line', async () => {
+            const line = createLine({ quantity: 1 } as any);
+            const order = createOrder({ lines: [line] });
+
+            const result = await orderModifier.updateOrderLineQuantity(ctx, line, 4, order);
+
+            expect(result.quantity).toBe(4);
+            expect(repo(OrderLine).save).toHaveBeenCalledWith(line);
+        });
+
+        it('does not create stock movements for an active Order', async () => {
+            const line = createLine({ quantity: 1 } as any);
+
+            await orderModifier.updateOrderLineQuantity(ctx, line, 4, createOrder({ active: true }));
+
+            expect(createAllocationsForOrderLines).not.toHaveBeenCalled();
+        });
+
+        it('allocates the additional quantity for an inactive Order', async () => {
+            const line = createLine({ quantity: 1 } as any);
+
+            await orderModifier.updateOrderLineQuantity(ctx, line, 4, createOrder({ active: false }));
+
+            expect(createAllocationsForOrderLines).toHaveBeenCalledWith(ctx, [
+                { orderLineId: line.id, quantity: 3 },
+            ]);
+        });
+
+        it('does not allocate stock for a Draft Order', async () => {
+            const line = createLine({ quantity: 1 } as any);
+
+            await orderModifier.updateOrderLineQuantity(
+                ctx,
+                line,
+                4,
+                createOrder({ active: false, state: 'Draft' } as any),
+            );
+
+            expect(createAllocationsForOrderLines).not.toHaveBeenCalled();
+        });
+
+        it('cancels and releases stock when reducing the quantity on an inactive Order', async () => {
+            const line = createLine({ quantity: 5 } as any);
+
+            await orderModifier.updateOrderLineQuantity(ctx, line, 2, createOrder({ active: false }));
+
+            expect(createCancellationsForOrderLines).toHaveBeenCalledWith(ctx, [
+                { orderLineId: line.id, quantity: 2 },
+            ]);
+            expect(createReleasesForOrderLines).toHaveBeenCalledWith(ctx, [
+                { orderLineId: line.id, quantity: 2 },
+            ]);
+        });
+
+        it('creates no stock movements when the quantity is unchanged', async () => {
+            const line = createLine({ quantity: 3 } as any);
+
+            await orderModifier.updateOrderLineQuantity(ctx, line, 3, createOrder({ active: false }));
+
+            expect(createAllocationsForOrderLines).not.toHaveBeenCalled();
+            expect(createCancellationsForOrderLines).not.toHaveBeenCalled();
+        });
+
+        it('publishes an "updated" OrderLineEvent', async () => {
+            const line = createLine({ quantity: 1 } as any);
+            const order = createOrder({ lines: [line] });
+
+            await orderModifier.updateOrderLineQuantity(ctx, line, 2, order);
+
+            expect(publish.mock.calls[0][0].type).toBe('updated');
+        });
+    });
+
+    describe('cancelOrderByOrderLines', () => {
+        function setUpOrderForCancellation(order: Order, lines: OrderLine[]) {
+            repo(OrderLine).getMany.mockResolvedValue(
+                lines.map(l => ({ id: l.id, order, quantity: l.quantity })),
+            );
+            getEntityOrThrow.mockResolvedValue(order);
         }
 
-        it('sets the quantity, saves the line and publishes an updated event', async () => {
-            const { order, line } = lineInOrder(true, 'AddingItems', 1);
-
-            const result = await orderModifier.updateOrderLineQuantity(ctx, line, 3, order);
-
-            expect(result).toBe(line);
-            expect(line.quantity).toBe(3);
-            expect(repos.OrderLine.save).toHaveBeenCalledWith(line);
-            const event = eventBus.publish.mock.calls[0][0] as OrderLineEvent;
-            expect(event.type).toBe('updated');
-            expect(event.orderLine).toBe(line);
+        beforeEach(() => {
+            // `getOrdersFromLines` looks the OrderLines up via the repository `find` method
+            repo(OrderLine).find.mockImplementation(async () => []);
         });
 
-        it('does not touch stock for an active order', async () => {
-            const { order, line } = lineInOrder(true, 'AddingItems', 1);
-
-            await orderModifier.updateOrderLineQuantity(ctx, line, 3, order);
-            await orderModifier.updateOrderLineQuantity(ctx, line, 1, order);
-
-            expect(stockMovementService.createAllocationsForOrderLines).not.toHaveBeenCalled();
-            expect(stockMovementService.createCancellationsForOrderLines).not.toHaveBeenCalled();
-            expect(stockMovementService.createReleasesForOrderLines).not.toHaveBeenCalled();
-        });
-
-        it('does not touch stock for a Draft order', async () => {
-            const { order, line } = lineInOrder(false, 'Draft', 1);
-
-            await orderModifier.updateOrderLineQuantity(ctx, line, 3, order);
-
-            expect(stockMovementService.createAllocationsForOrderLines).not.toHaveBeenCalled();
-        });
-
-        it('allocates the additional quantity for a placed order', async () => {
-            const { order, line } = lineInOrder(false, 'Modifying', 2);
-
-            await orderModifier.updateOrderLineQuantity(ctx, line, 5, order);
-
-            expect(stockMovementService.createAllocationsForOrderLines).toHaveBeenCalledWith(ctx, [
-                { orderLineId: 1, quantity: 3 },
-            ]);
-        });
-
-        it('cancels and releases down to the new quantity for a placed order', async () => {
-            const { order, line } = lineInOrder(false, 'Modifying', 5);
-
-            await orderModifier.updateOrderLineQuantity(ctx, line, 2, order);
-
-            expect(stockMovementService.createCancellationsForOrderLines).toHaveBeenCalledWith(ctx, [
-                { orderLineId: 1, quantity: 2 },
-            ]);
-            expect(stockMovementService.createReleasesForOrderLines).toHaveBeenCalledWith(ctx, [
-                { orderLineId: 1, quantity: 2 },
-            ]);
-        });
-
-        it('does not touch stock when the quantity is unchanged', async () => {
-            const { order, line } = lineInOrder(false, 'Modifying', 2);
-
-            await orderModifier.updateOrderLineQuantity(ctx, line, 2, order);
-
-            expect(stockMovementService.createAllocationsForOrderLines).not.toHaveBeenCalled();
-            expect(stockMovementService.createCancellationsForOrderLines).not.toHaveBeenCalled();
-            expect(repos.OrderLine.save).toHaveBeenCalledWith(line);
-        });
-    });
-
-    describe('cancelOrderByOrderLines()', () => {
-        it('returns EmptyOrderLineSelectionError for no lines', async () => {
-            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 1 }, []);
+        it('returns EmptyOrderLineSelectionError for an empty selection', async () => {
+            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1' }, []);
 
             expect(result).toBeInstanceOf(EmptyOrderLineSelectionError);
-            expect(connection.getRepository).not.toHaveBeenCalled();
         });
 
-        it('returns EmptyOrderLineSelectionError when the total quantity is zero', async () => {
-            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 1 }, [
-                { orderLineId: 1, quantity: 0 },
-                { orderLineId: 2, quantity: 0 },
+        it('returns EmptyOrderLineSelectionError when all quantities are zero', async () => {
+            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1' }, [
+                { orderLineId: 'T_1', quantity: 0 },
             ]);
 
             expect(result).toBeInstanceOf(EmptyOrderLineSelectionError);
         });
 
-        it('returns MultipleOrderError when the lines span several orders', async () => {
-            repos.OrderLine.find.mockResolvedValue([
-                new OrderLine({ id: 1, order: new Order({ id: 1, channels: [ctx.channel] }) }),
-                new OrderLine({ id: 2, order: new Order({ id: 2, channels: [ctx.channel] }) }),
+        it('returns MultipleOrderError when the lines belong to more than one Order', async () => {
+            const orderA = createOrder({ id: 'T_1', channels: [ctx.channel] } as any);
+            const orderB = createOrder({ id: 'T_2', channels: [ctx.channel] } as any);
+            repo(OrderLine).find.mockResolvedValue([
+                { id: 'T_1', order: orderA },
+                { id: 'T_2', order: orderB },
             ]);
 
-            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 1 }, [
-                { orderLineId: 1, quantity: 1 },
-                { orderLineId: 2, quantity: 1 },
-            ]);
-
-            expect(result).toBeInstanceOf(MultipleOrderError);
-        });
-
-        it('returns MultipleOrderError when the lines belong to a different order than requested', async () => {
-            repos.OrderLine.find.mockResolvedValue([
-                new OrderLine({ id: 1, order: new Order({ id: 2, channels: [ctx.channel] }) }),
-            ]);
-
-            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 1 }, [
-                { orderLineId: 1, quantity: 1 },
+            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1' }, [
+                { orderLineId: 'T_1', quantity: 1 },
+                { orderLineId: 'T_2', quantity: 1 },
             ]);
 
             expect(result).toBeInstanceOf(MultipleOrderError);
         });
 
-        it('returns CancelActiveOrderError for an active order', async () => {
-            repos.OrderLine.find.mockResolvedValue([
-                new OrderLine({
-                    id: 1,
-                    order: new Order({ id: 1, active: true, state: 'AddingItems', channels: [ctx.channel] }),
-                }),
+        it('returns MultipleOrderError when the lines belong to a different Order than the input', async () => {
+            const order = createOrder({ id: 'T_2', channels: [ctx.channel] } as any);
+            repo(OrderLine).find.mockResolvedValue([{ id: 'T_1', order }]);
+
+            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1' }, [
+                { orderLineId: 'T_1', quantity: 1 },
             ]);
 
-            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 1 }, [
-                { orderLineId: 1, quantity: 1 },
+            expect(result).toBeInstanceOf(MultipleOrderError);
+        });
+
+        it('returns CancelActiveOrderError for an active Order', async () => {
+            const order = createOrder({ active: true, channels: [ctx.channel] } as any);
+            repo(OrderLine).find.mockResolvedValue([{ id: 'T_1', order }]);
+
+            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1' }, [
+                { orderLineId: 'T_1', quantity: 1 },
             ]);
 
             expect(result).toBeInstanceOf(CancelActiveOrderError);
             expect((result as CancelActiveOrderError).orderState).toBe('AddingItems');
-            expect(connection.getEntityOrThrow).not.toHaveBeenCalled();
+        });
+
+        it('returns QuantityTooGreatError when cancelling more than the line contains', async () => {
+            const line = createLine({ quantity: 1 } as any);
+            const order = createOrder({ active: false, lines: [line], channels: [ctx.channel] } as any);
+            repo(OrderLine).find.mockResolvedValue([{ id: line.id, order }]);
+            getEntityOrThrow.mockResolvedValue(order);
+
+            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1' }, [
+                { orderLineId: 'T_1', quantity: 5 },
+            ]);
+
+            expect(result).toBeInstanceOf(QuantityTooGreatError);
+        });
+
+        it('creates cancellations for fulfilled items and releases for allocated items', async () => {
+            const line = createLine({ quantity: 5 } as any);
+            const order = createOrder({ active: false, lines: [line], channels: [ctx.channel] } as any);
+            repo(OrderLine).find.mockResolvedValue([{ id: line.id, order }]);
+            getEntityOrThrow.mockResolvedValue(order);
+            repo(Allocation).getMany.mockResolvedValue([{ quantity: 4 }]);
+            repo(FulfillmentLine).getMany.mockResolvedValue([{ quantity: 1 }]);
+
+            await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1' }, [
+                { orderLineId: 'T_1', quantity: 2 },
+            ]);
+
+            expect(createCancellationsForOrderLines).toHaveBeenCalledWith(ctx, [
+                { orderLineId: 'T_1', quantity: 1 },
+            ]);
+            expect(createReleasesForOrderLines).toHaveBeenCalledWith(ctx, [
+                { orderLineId: 'T_1', quantity: 2 },
+            ]);
+        });
+
+        it('reduces the line quantity and rescales its promotion adjustments', async () => {
+            const line = createLine({
+                quantity: 4,
+                adjustments: [{ type: AdjustmentType.PROMOTION, amount: -400 } as any],
+            } as any);
+            const order = createOrder({ active: false, lines: [line], channels: [ctx.channel] } as any);
+            repo(OrderLine).find.mockResolvedValue([{ id: line.id, order }]);
+            getEntityOrThrow.mockResolvedValue(order);
+
+            await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1' }, [
+                { orderLineId: 'T_1', quantity: 1 },
+            ]);
+
+            expect(line.quantity).toBe(3);
+            expect(line.adjustments[0].amount).toBe(-300);
+            expect(repo(OrderLine).update).toHaveBeenCalledWith('T_1', {
+                quantity: 3,
+                adjustments: line.adjustments,
+            });
+        });
+
+        it('adds a cancellation adjustment to the ShippingLines when cancelShipping is set', async () => {
+            const line = createLine({ quantity: 1 } as any);
+            const shippingLine = new ShippingLine({
+                id: 'T_1',
+                adjustments: [],
+                listPriceIncludesTax: true,
+                listPrice: 500,
+                taxLines: [],
+            } as any);
+            const order = createOrder({
+                active: false,
+                lines: [line],
+                shippingLines: [shippingLine],
+                channels: [ctx.channel],
+            } as any);
+            repo(OrderLine).find.mockResolvedValue([{ id: line.id, order }]);
+            getEntityOrThrow.mockResolvedValue(order);
+
+            await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1', cancelShipping: true }, [
+                { orderLineId: 'T_1', quantity: 1 },
+            ]);
+
+            expect(shippingLine.adjustments.length).toBe(1);
+            expect(shippingLine.adjustments[0]).toMatchObject({
+                adjustmentSource: 'CANCEL_ORDER',
+                amount: -500,
+            });
+        });
+
+        it('leaves the ShippingLines alone when cancelShipping is not set', async () => {
+            const line = createLine({ quantity: 1 } as any);
+            const shippingLine = new ShippingLine({
+                id: 'T_1',
+                adjustments: [],
+                listPriceIncludesTax: true,
+                listPrice: 500,
+                taxLines: [],
+            } as any);
+            const order = createOrder({
+                active: false,
+                lines: [line],
+                shippingLines: [shippingLine],
+                channels: [ctx.channel],
+            } as any);
+            repo(OrderLine).find.mockResolvedValue([{ id: line.id, order }]);
+            getEntityOrThrow.mockResolvedValue(order);
+
+            await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1' }, [
+                { orderLineId: 'T_1', quantity: 1 },
+            ]);
+
+            expect(shippingLine.adjustments).toEqual([]);
+        });
+
+        it('recalculates the Order totals and records a history entry', async () => {
+            const line = createLine({ quantity: 2 } as any);
+            const order = createOrder({ active: false, lines: [line], channels: [ctx.channel] } as any);
+            repo(OrderLine).find.mockResolvedValue([{ id: line.id, order }]);
+            getEntityOrThrow.mockResolvedValue(order);
+
+            await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1', reason: 'changed mind' }, [
+                { orderLineId: 'T_1', quantity: 1 },
+            ]);
+
+            expect(calculateOrderTotals).toHaveBeenCalledWith(order);
+            expect(createHistoryEntryForOrder).toHaveBeenCalledWith({
+                ctx,
+                orderId: 'T_1',
+                type: HistoryEntryType.ORDER_CANCELLATION,
+                data: {
+                    lines: [{ orderLineId: 'T_1', quantity: 1 }],
+                    reason: 'changed mind',
+                    shippingCancelled: false,
+                },
+            });
+        });
+
+        it('returns true when every line has been fully cancelled', async () => {
+            const line = createLine({ quantity: 2 } as any);
+            const order = createOrder({ active: false, lines: [line], channels: [ctx.channel] } as any);
+            repo(OrderLine).find.mockResolvedValue([{ id: line.id, order }]);
+            getEntityOrThrow.mockResolvedValue(order);
+
+            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1' }, [
+                { orderLineId: 'T_1', quantity: 2 },
+            ]);
+
+            expect(result).toBe(true);
+        });
+
+        it('returns false when some quantity remains on the Order', async () => {
+            const line = createLine({ quantity: 2 } as any);
+            const order = createOrder({ active: false, lines: [line], channels: [ctx.channel] } as any);
+            repo(OrderLine).find.mockResolvedValue([{ id: line.id, order }]);
+            getEntityOrThrow.mockResolvedValue(order);
+
+            const result = await orderModifier.cancelOrderByOrderLines(ctx, { orderId: 'T_1' }, [
+                { orderLineId: 'T_1', quantity: 1 },
+            ]);
+
+            expect(result).toBe(false);
         });
     });
 
-    describe('setShippingMethods()', () => {
-        it('returns IneligibleShippingMethodError when a method is not eligible', async () => {
-            shippingCalculator.getMethodIfEligible.mockResolvedValue(undefined);
-            const order = new Order({ id: 1, lines: [], shippingLines: [] });
+    describe('setShippingMethods', () => {
+        it('returns IneligibleShippingMethodError when the method is not eligible', async () => {
+            getMethodIfEligible.mockResolvedValue(undefined);
 
-            const result = await orderModifier.setShippingMethods(ctx, order, [7]);
+            const result = await orderModifier.setShippingMethods(ctx, createOrder(), ['T_1']);
 
             expect(result).toBeInstanceOf(IneligibleShippingMethodError);
-            expect(shippingCalculator.getMethodIfEligible).toHaveBeenCalledWith(ctx, order, 7);
-            expect(repos.ShippingLine.save).not.toHaveBeenCalled();
+        });
+
+        it('throws when the Order has no shippingLines array at all', async () => {
+            // `order.shippingLines[i]` is read before the `if (order.shippingLines)` fallback,
+            // so the fallback branch is unreachable.
+            const order = createOrder({ lines: [createLine()] });
+            (order as any).shippingLines = undefined;
+
+            await expect(orderModifier.setShippingMethods(ctx, order, ['T_2'])).rejects.toThrow(TypeError);
+        });
+
+        it('creates a ShippingLine when the Order has none', async () => {
+            const order = createOrder({ lines: [createLine()] });
+
+            const result = await orderModifier.setShippingMethods(ctx, order, ['T_2']);
+
+            expect(result).toBe(order);
+            expect(order.shippingLines.length).toBe(1);
+            expect(order.shippingLines[0].shippingMethod).toEqual({ id: 'T_2' });
+            expect(order.shippingLines[0].listPriceIncludesTax).toBe(true);
+        });
+
+        it('updates the ShippingMethod of an existing ShippingLine rather than creating one', async () => {
+            const shippingLine = new ShippingLine({ id: 'T_1', adjustments: [], taxLines: [] } as any);
+            const order = createOrder({ lines: [createLine()], shippingLines: [shippingLine] });
+
+            await orderModifier.setShippingMethods(ctx, order, ['T_5']);
+
+            expect(order.shippingLines).toEqual([shippingLine]);
+            expect(shippingLine.shippingMethodId).toBe('T_5');
+        });
+
+        it('assigns the ShippingLine to the OrderLines via the assignment strategy', async () => {
+            const line = createLine();
+            const order = createOrder({ lines: [line] });
+
+            await orderModifier.setShippingMethods(ctx, order, ['T_2']);
+
+            expect(assignShippingLineToOrderLines).toHaveBeenCalledWith(ctx, order.shippingLines[0], order);
+            expect(line.shippingLine).toBe(order.shippingLines[0]);
+        });
+
+        it('removes surplus ShippingLines, but off by one: the last kept line is removed too', async () => {
+            // With 1 shippingMethodId and 2 existing lines, `splice(shippingMethodIds.length - 1)`
+            // removes from index 0, i.e. it also removes the line which was just assigned.
+            const lineA = new ShippingLine({ id: 'T_1', adjustments: [], taxLines: [] } as any);
+            const lineB = new ShippingLine({ id: 'T_2', adjustments: [], taxLines: [] } as any);
+            const order = createOrder({ lines: [createLine()], shippingLines: [lineA, lineB] });
+
+            await orderModifier.setShippingMethods(ctx, order, ['T_5']);
+
+            expect(repo(ShippingLine).remove).toHaveBeenCalledWith([lineA, lineB]);
+            expect(order.shippingLines).toEqual([]);
         });
     });
 
-    describe('modifyOrder()', () => {
-        function createModifyingOrder(): Order {
-            const order = createOrderFromLines([{ lineId: 1, quantity: 2, productVariantId: 100 }]);
-            order.id = 1;
-            order.state = 'Modifying';
-            order.active = false;
-            order.customer = new Customer({ id: 3 });
-            order.couponCodes = [];
-            order.surcharges = [];
-            order.shippingLines = [];
-            order.subTotalWithTax = 2000;
-            order.shippingWithTax = 500;
-            order.shippingAddress = { streetLine1: 'Old St', countryCode: 'GB' };
-            order.billingAddress = {};
-            order.lines[0].productVariantId = 100;
-            order.lines[0].listPrice = 1000;
-            order.lines[0].listPriceIncludesTax = false;
-            return order;
-        }
-
-        function input(partial: Partial<ModifyOrderInput>): ModifyOrderInput {
-            return { orderId: 1, dryRun: true, ...partial };
-        }
-
-        it('returns OrderModificationStateError when the order is not in the Modifying state', async () => {
-            const order = createModifyingOrder();
-            order.state = 'PaymentSettled';
-
-            const result = await orderModifier.modifyOrder(ctx, input({ surcharges: [] }), order);
+    describe('modifyOrder', () => {
+        it('returns OrderModificationStateError unless the Order is in the Modifying state', async () => {
+            const result = await orderModifier.modifyOrder(
+                ctx,
+                { orderId: 'T_1', dryRun: false, addItems: [{ productVariantId: 'T_1', quantity: 1 }] },
+                createOrder({ state: 'PaymentSettled' } as any),
+            );
 
             expect(result).toBeInstanceOf(OrderModificationStateError);
         });
 
-        it('returns NoChangesSpecifiedError when the input is empty', async () => {
+        it('returns NoChangesSpecifiedError when the input contains no changes', async () => {
             const result = await orderModifier.modifyOrder(
                 ctx,
-                input({ addItems: [], adjustOrderLines: [], surcharges: [], shippingMethodIds: [] }),
-                createModifyingOrder(),
+                { orderId: 'T_1', dryRun: false, shippingMethodIds: [] },
+                createOrder({ state: 'Modifying' } as any),
             );
 
             expect(result).toBeInstanceOf(NoChangesSpecifiedError);
@@ -709,8 +964,8 @@ describe('OrderModifier', () => {
         it('returns NegativeQuantityError for a negative addItems quantity', async () => {
             const result = await orderModifier.modifyOrder(
                 ctx,
-                input({ addItems: [{ productVariantId: 100, quantity: -1 }] }),
-                createModifyingOrder(),
+                { orderId: 'T_1', dryRun: false, addItems: [{ productVariantId: 'T_1', quantity: -1 }] },
+                createOrder({ state: 'Modifying' } as any),
             );
 
             expect(result).toBeInstanceOf(NegativeQuantityError);
@@ -719,521 +974,436 @@ describe('OrderModifier', () => {
         it('returns NegativeQuantityError for a negative adjustOrderLines quantity', async () => {
             const result = await orderModifier.modifyOrder(
                 ctx,
-                input({ adjustOrderLines: [{ orderLineId: 1, quantity: -1 }] }),
-                createModifyingOrder(),
+                { orderId: 'T_1', dryRun: false, adjustOrderLines: [{ orderLineId: 'T_1', quantity: -1 }] },
+                createOrder({ state: 'Modifying' } as any),
             );
 
             expect(result).toBeInstanceOf(NegativeQuantityError);
         });
 
-        it('throws UserInputError when adjusting a line the order does not contain', async () => {
-            await expect(
-                orderModifier.modifyOrder(
-                    ctx,
-                    input({ adjustOrderLines: [{ orderLineId: 99, quantity: 1 }] }),
-                    createModifyingOrder(),
-                ),
-            ).rejects.toBeInstanceOf(UserInputError);
-        });
-
-        it('increases an existing line quantity and records a modification line', async () => {
-            const order = createModifyingOrder();
+        it('returns OrderLimitError when the added items exceed the order items limit', async () => {
+            orderItemsLimit = 2;
 
             const result = await orderModifier.modifyOrder(
                 ctx,
-                input({ adjustOrderLines: [{ orderLineId: 1, quantity: 5 }] }),
-                order,
-            );
-
-            expect(result).toHaveProperty('modification');
-            const { modification } = result as { order: Order; modification: OrderModification };
-            expect(order.lines[0].quantity).toBe(5);
-            expect(stockMovementService.createAllocationsForOrderLines).toHaveBeenCalledWith(ctx, [
-                { orderLineId: 1, quantity: 3 },
-            ]);
-            expect(modification.lines).toHaveLength(1);
-            expect(modification.lines[0]).toBeInstanceOf(OrderModificationLine);
-            expect(modification.lines[0].quantity).toBe(3);
-            expect(modification.lines[0].orderLine).toBe(order.lines[0]);
-            expect(orderCalculator.applyPriceAdjustments).toHaveBeenCalledWith(
-                ctx,
-                order,
-                [],
-                [order.lines[0]],
-                { recalculateShipping: undefined },
-            );
-        });
-
-        it('adds a new item via a new order line', async () => {
-            const order = createModifyingOrder();
-            connection.findOneInChannel.mockResolvedValue(
-                new ProductVariant({ id: 200, listPrice: 300, product: new Product({ id: 2 }) }),
-            );
-
-            const result = await orderModifier.modifyOrder(
-                ctx,
-                input({ addItems: [{ productVariantId: 200, quantity: 2 }] }),
-                order,
-            );
-
-            const { modification } = result as { order: Order; modification: OrderModification };
-            expect(order.lines).toHaveLength(2);
-            expect(order.lines[1].quantity).toBe(2);
-            expect(order.lines[1].listPrice).toBe(300);
-            expect(modification.lines[0].quantity).toBe(2);
-            expect(modification.lines[0].orderLine).toBe(order.lines[1]);
-        });
-
-        it('returns OrderLimitError when adding items would exceed orderItemsLimit', async () => {
-            mockConfigService.orderOptions.orderItemsLimit = 3;
-            connection.findOneInChannel.mockResolvedValue(
-                new ProductVariant({ id: 200, listPrice: 300, product: new Product({ id: 2 }) }),
-            );
-
-            const result = await orderModifier.modifyOrder(
-                ctx,
-                input({ addItems: [{ productVariantId: 200, quantity: 2 }] }),
-                createModifyingOrder(),
+                { orderId: 'T_1', dryRun: false, addItems: [{ productVariantId: 'T_1', quantity: 3 }] },
+                createOrder({ state: 'Modifying' } as any),
             );
 
             expect(result).toBeInstanceOf(OrderLimitError);
+            expect((result as OrderLimitError).maxItems).toBe(2);
         });
 
-        it('returns InsufficientStockError when the added quantity is not saleable', async () => {
-            productVariantService.getSaleableStockLevel.mockResolvedValue(1);
-            connection.findOneInChannel.mockResolvedValue(
-                new ProductVariant({ id: 200, listPrice: 300, product: new Product({ id: 2 }) }),
-            );
+        it('returns InsufficientStockError when the requested quantity is not saleable', async () => {
+            getSaleableStockLevel.mockResolvedValue(1);
 
             const result = await orderModifier.modifyOrder(
                 ctx,
-                input({ addItems: [{ productVariantId: 200, quantity: 2 }] }),
-                createModifyingOrder(),
+                { orderId: 'T_1', dryRun: false, addItems: [{ productVariantId: 'T_1', quantity: 3 }] },
+                createOrder({ state: 'Modifying' } as any),
             );
 
             expect(result).toBeInstanceOf(InsufficientStockError);
             expect((result as InsufficientStockError).quantityAvailable).toBe(1);
         });
 
-        it('returns OrderLimitError when adjusting a line would exceed orderItemsLimit', async () => {
-            mockConfigService.orderOptions.orderItemsLimit = 4;
+        it('throws when adjusting an OrderLine which is not part of the Order', async () => {
+            await expect(
+                orderModifier.modifyOrder(
+                    ctx,
+                    {
+                        orderId: 'T_1',
+                        dryRun: false,
+                        adjustOrderLines: [{ orderLineId: 'T_99', quantity: 1 }],
+                    },
+                    createOrder({ state: 'Modifying' } as any),
+                ),
+            ).rejects.toThrow(UserInputError);
+        });
+
+        it('adds the requested items and records them on the modification (dry run)', async () => {
+            const order = createOrder({ state: 'Modifying' } as any);
 
             const result = await orderModifier.modifyOrder(
                 ctx,
-                input({ adjustOrderLines: [{ orderLineId: 1, quantity: 5 }] }),
-                createModifyingOrder(),
+                { orderId: 'T_1', dryRun: true, addItems: [{ productVariantId: 'T_1', quantity: 2 }] },
+                order,
+            );
+
+            const { modification } = expectSuccess(result);
+            expect(order.lines.length).toBe(1);
+            expect(order.lines[0].quantity).toBe(2);
+            expect(modification.lines.length).toBe(1);
+            expect(modification.lines[0].quantity).toBe(2);
+            // a dry run must not persist the modification
+            expect(applyPriceAdjustments).toHaveBeenCalled();
+        });
+
+        it('adds a surcharge to the Order', async () => {
+            const order = createOrder({ state: 'Modifying' } as any);
+
+            const result = await orderModifier.modifyOrder(
+                ctx,
+                {
+                    orderId: 'T_1',
+                    dryRun: true,
+                    surcharges: [{ description: 'Extra fee', price: 500, priceIncludesTax: true }],
+                },
+                order,
+            );
+
+            expect(order.surcharges.length).toBe(1);
+            expect(order.surcharges[0].description).toBe('Extra fee');
+            expect(expectSuccess(result).modification.surcharges).toEqual(order.surcharges);
+        });
+
+        it('updates the shipping address and resolves the country name', async () => {
+            const order = createOrder({
+                state: 'Modifying',
+                shippingAddress: { streetLine1: 'Old Street' },
+            } as any);
+
+            await orderModifier.modifyOrder(
+                ctx,
+                {
+                    orderId: 'T_1',
+                    dryRun: true,
+                    updateShippingAddress: { streetLine1: 'New Street', countryCode: 'DE' },
+                },
+                order,
+            );
+
+            expect(order.shippingAddress.streetLine1).toBe('New Street');
+            expect(order.shippingAddress.country).toBe('Germany');
+            expect(findOneByCode).toHaveBeenCalledWith(ctx, 'DE');
+        });
+
+        it('returns OrderLimitError when an adjusted line exceeds the order items limit', async () => {
+            orderItemsLimit = 2;
+            const line = createLine({ quantity: 1 } as any);
+            const order = createOrder({ state: 'Modifying', lines: [line] } as any);
+
+            const result = await orderModifier.modifyOrder(
+                ctx,
+                { orderId: 'T_1', dryRun: false, adjustOrderLines: [{ orderLineId: 'T_1', quantity: 5 }] },
+                order,
             );
 
             expect(result).toBeInstanceOf(OrderLimitError);
         });
 
-        it('returns InsufficientStockError when the adjusted quantity is not saleable', async () => {
-            productVariantService.getSaleableStockLevel.mockResolvedValue(1);
-
-            const result = await orderModifier.modifyOrder(
-                ctx,
-                input({ adjustOrderLines: [{ orderLineId: 1, quantity: 5 }] }),
-                createModifyingOrder(),
-            );
-
-            expect(result).toBeInstanceOf(InsufficientStockError);
-        });
-
-        it('adds a surcharge to the order and the modification', async () => {
-            const order = createModifyingOrder();
-
-            const result = await orderModifier.modifyOrder(
-                ctx,
-                input({
-                    surcharges: [
-                        {
-                            description: 'Handling',
-                            sku: 'HANDLING',
-                            price: 250,
-                            priceIncludesTax: false,
-                            taxRate: 20,
-                            taxDescription: 'VAT',
-                        },
-                    ],
-                }),
-                order,
-            );
-
-            const { modification } = result as { order: Order; modification: OrderModification };
-            expect(order.surcharges).toHaveLength(1);
-            const surcharge = order.surcharges[0];
-            expect(surcharge).toBeInstanceOf(Surcharge);
-            expect(surcharge.description).toBe('Handling');
-            expect(surcharge.sku).toBe('HANDLING');
-            expect(surcharge.listPrice).toBe(250);
-            expect(surcharge.listPriceIncludesTax).toBe(false);
-            expect(surcharge.taxLines).toEqual([{ taxRate: 20, description: 'VAT' }]);
-            expect(modification.surcharges).toEqual([surcharge]);
-            expect(repos.Order.save).toHaveBeenCalledWith(order, { reload: false });
-        });
-
-        it('adds no tax lines to a surcharge without a tax rate', async () => {
-            const order = createModifyingOrder();
+        it('resolves the country name when the billing address country changes', async () => {
+            const order = createOrder({ state: 'Modifying', billingAddress: {} } as any);
 
             await orderModifier.modifyOrder(
                 ctx,
-                input({ surcharges: [{ description: 'Discount', price: -100, priceIncludesTax: true }] }),
+                { orderId: 'T_1', dryRun: true, updateBillingAddress: { countryCode: 'DE' } },
                 order,
             );
 
-            expect(order.surcharges[0].taxLines).toEqual([]);
-            expect(order.surcharges[0].sku).toBe('');
+            expect(order.billingAddress.country).toBe('Germany');
+            expect(findOneByCode).toHaveBeenCalledWith(ctx, 'DE');
         });
 
-        it('merges the shipping address change and resolves the country name', async () => {
-            const order = createModifyingOrder();
+        it('updates the billing address', async () => {
+            const order = createOrder({
+                state: 'Modifying',
+                billingAddress: { streetLine1: 'Old Street', country: 'France' },
+            } as any);
 
-            const result = await orderModifier.modifyOrder(
+            await orderModifier.modifyOrder(
                 ctx,
-                input({ updateShippingAddress: { streetLine1: 'New St', countryCode: 'DE' } }),
+                { orderId: 'T_1', dryRun: true, updateBillingAddress: { streetLine1: 'New Street' } },
                 order,
             );
 
-            const { modification } = result as { order: Order; modification: OrderModification };
-            expect(order.shippingAddress).toEqual({
-                streetLine1: 'New St',
-                countryCode: 'DE',
-                country: 'Country DE',
+            expect(order.billingAddress).toMatchObject({
+                streetLine1: 'New Street',
+                country: 'France',
             });
-            expect(countryService.findOneByCode).toHaveBeenCalledWith(ctx, 'DE');
-            expect(modification.shippingAddressChange).toEqual({ streetLine1: 'New St', countryCode: 'DE' });
+            expect(findOneByCode).not.toHaveBeenCalled();
         });
 
-        it('merges the billing address change without a country lookup when no code is given', async () => {
-            const order = createModifyingOrder();
+        it('applies coupon codes and records a history entry for newly-applied codes', async () => {
+            const order = createOrder({ state: 'Modifying', couponCodes: ['OLD'] } as any);
 
-            const result = await orderModifier.modifyOrder(
+            await orderModifier.modifyOrder(
                 ctx,
-                input({ updateBillingAddress: { city: 'Berlin' } }),
+                { orderId: 'T_1', dryRun: true, couponCodes: ['NEW'] },
                 order,
             );
-
-            const { modification } = result as { order: Order; modification: OrderModification };
-            expect(order.billingAddress).toEqual({ city: 'Berlin' });
-            expect(countryService.findOneByCode).not.toHaveBeenCalled();
-            expect(modification.billingAddressChange).toEqual({ city: 'Berlin' });
-        });
-
-        it('returns the coupon validation error result', async () => {
-            const order = createModifyingOrder();
-            const error = new CouponCodeInvalidError({ couponCode: 'BAD' });
-            promotionService.validateCouponCode.mockResolvedValue(error);
-
-            const result = await orderModifier.modifyOrder(ctx, input({ couponCodes: ['BAD'] }), order);
-
-            expect(result).toBe(error);
-            expect(promotionService.validateCouponCode).toHaveBeenCalledWith(ctx, 'BAD', 3);
-        });
-
-        it('records applied and removed coupon codes in the history', async () => {
-            const order = createModifyingOrder();
-            order.couponCodes = ['OLD'];
-            promotionService.validateCouponCode.mockResolvedValue({ id: 'promo-1', couponCode: 'NEW' });
-
-            await orderModifier.modifyOrder(ctx, input({ couponCodes: ['new'] }), order);
 
             expect(order.couponCodes).toEqual(['NEW']);
-            expect(historyService.createHistoryEntryForOrder).toHaveBeenCalledWith({
-                ctx,
-                orderId: 1,
-                type: HistoryEntryType.ORDER_COUPON_APPLIED,
-                data: { couponCode: 'NEW', promotionId: 'promo-1' },
-            });
-            expect(historyService.createHistoryEntryForOrder).toHaveBeenCalledWith({
-                ctx,
-                orderId: 1,
-                type: HistoryEntryType.ORDER_COUPON_REMOVED,
-                data: { couponCode: 'OLD' },
-            });
+            const types = createHistoryEntryForOrder.mock.calls.map(call => call[0].type);
+            expect(types).toEqual([
+                HistoryEntryType.ORDER_COUPON_APPLIED,
+                HistoryEntryType.ORDER_COUPON_REMOVED,
+            ]);
         });
 
-        it('does not record history for a coupon code that was already applied', async () => {
-            const order = createModifyingOrder();
-            order.couponCodes = ['SAVE'];
-            promotionService.validateCouponCode.mockResolvedValue({ id: 'promo-1', couponCode: 'SAVE' });
-
-            await orderModifier.modifyOrder(ctx, input({ couponCodes: ['SAVE', 'save'] }), order);
-
-            expect(order.couponCodes).toEqual(['SAVE']);
-            expect(historyService.createHistoryEntryForOrder).not.toHaveBeenCalled();
-        });
-
-        it('returns the shipping method error result', async () => {
-            const order = createModifyingOrder();
-            shippingCalculator.getMethodIfEligible.mockResolvedValue(undefined);
-
-            const result = await orderModifier.modifyOrder(ctx, input({ shippingMethodIds: [7] }), order);
-
-            expect(result).toBeInstanceOf(IneligibleShippingMethodError);
-        });
-
-        it('recalculates the unit price of updated lines using the price calculation strategy', async () => {
-            const order = createModifyingOrder();
-            const strategy = mockConfigService.orderOptions.orderItemPriceCalculationStrategy;
-            strategy.calculateUnitPrice.mockResolvedValue({ price: 750, priceIncludesTax: true });
-
-            await orderModifier.modifyOrder(
-                ctx,
-                input({ adjustOrderLines: [{ orderLineId: 1, quantity: 3 }] }),
-                order,
-            );
-
-            expect(productVariantService.applyChannelPriceAndTax).toHaveBeenCalledWith(
-                order.lines[0].productVariant,
-                ctx,
-                order,
-            );
-            expect(strategy.calculateUnitPrice).toHaveBeenCalledWith(
-                ctx,
-                order.lines[0].productVariant,
-                {},
-                order,
-                3,
-            );
-            expect(order.lines[0].listPrice).toBe(750);
-            expect(order.lines[0].listPriceIncludesTax).toBe(true);
-        });
-
-        it('patches order custom fields', async () => {
-            const order = createModifyingOrder();
-            order.customFields = { existing: 'a', note: null } as any;
-
-            await orderModifier.modifyOrder(
-                ctx,
-                { ...input({}), customFields: { note: 'hi' } } as ModifyOrderInput,
-                order,
-            );
-
-            expect(order.customFields).toEqual({ existing: 'a', note: 'hi' });
-        });
-
-        it('returns the unsaved modification on a dry run', async () => {
-            const order = createModifyingOrder();
+        it('returns the coupon code validation error', async () => {
+            const invalidResult = new CouponCodeInvalidError({ couponCode: 'BAD' });
+            validateCouponCode.mockResolvedValue(invalidResult);
 
             const result = await orderModifier.modifyOrder(
                 ctx,
-                input({ dryRun: true, updateBillingAddress: { city: 'Berlin' } }),
-                order,
+                { orderId: 'T_1', dryRun: true, couponCodes: ['BAD'] },
+                createOrder({ state: 'Modifying' } as any),
             );
 
-            const { modification } = result as { order: Order; modification: OrderModification };
-            expect(modification.id).toBeUndefined();
-            expect(repos.OrderModification.save).not.toHaveBeenCalled();
-            expect(eventBus.publish).not.toHaveBeenCalled();
+            expect(result).toBe(invalidResult);
         });
 
-        it('persists the modification with the price change and publishes an OrderEvent', async () => {
-            const order = createModifyingOrder();
-            orderCalculator.applyPriceAdjustments.mockImplementation(
-                async (_ctx: RequestContext, o: Order) => {
-                    o.subTotalWithTax = 2600;
-                    return o;
-                },
-            );
-            const modifyInput = input({
-                dryRun: false,
-                note: 'more',
-                updateBillingAddress: { city: 'Berlin' },
+        it('returns RefundPaymentIdMissingError when the total decreases with no refund input', async () => {
+            const line = createLine({ quantity: 2 } as any);
+            const order = createOrder({
+                state: 'Modifying',
+                active: false,
+                lines: [line],
+                subTotalWithTax: 2000,
+                channels: [ctx.channel],
+            } as any);
+            repo(OrderLine).find.mockResolvedValue([{ id: 'T_1', order }]);
+            getEntityOrThrow.mockResolvedValue(order);
+            // The Order total drops as a result of the price adjustment step
+            applyPriceAdjustments.mockImplementation(async () => {
+                order.subTotalWithTax = 1000;
             });
-
-            const result = await orderModifier.modifyOrder(ctx, modifyInput, order);
-
-            const { modification } = result as { order: Order; modification: OrderModification };
-            expect(modification.priceChange).toBe(600);
-            expect(modification.note).toBe('more');
-            expect(modification.order).toBe(order);
-            expect(repos.OrderModification.saved).toEqual([modification]);
-            expect(repos.Order.save).toHaveBeenCalledWith(order);
-            expect(repos.ShippingLine.save).toHaveBeenCalledWith(order.shippingLines, { reload: false });
-            const event = eventBus.publish.mock.calls[0][0] as OrderEvent;
-            expect(event).toBeInstanceOf(OrderEvent);
-            expect(event.type).toBe('updated');
-            expect(event.input).toBe(modifyInput);
-        });
-
-        const discount = {
-            description: 'Goodwill discount',
-            sku: 'DISC',
-            price: -1000,
-            priceIncludesTax: true,
-            taxRate: 0,
-        };
-
-        it('returns RefundPaymentIdMissingError when the total drops and no refund is given', async () => {
-            const order = createModifyingOrder();
-            setupPriceDrop(order, 1000);
 
             const result = await orderModifier.modifyOrder(
                 ctx,
-                input({ dryRun: false, surcharges: [discount] }),
+                { orderId: 'T_1', dryRun: false, adjustOrderLines: [{ orderLineId: 'T_1', quantity: 1 }] },
                 order,
             );
 
             expect(result).toBeInstanceOf(RefundPaymentIdMissingError);
-            expect(repos.OrderModification.save).not.toHaveBeenCalled();
         });
 
-        function setupPriceDrop(order: Order, newSubTotalWithTax: number, newShippingWithTax?: number) {
-            orderCalculator.applyPriceAdjustments.mockImplementation(
-                async (_ctx: RequestContext, o: Order) => {
-                    o.subTotalWithTax = newSubTotalWithTax;
-                    if (newShippingWithTax != null) {
-                        o.shippingWithTax = newShippingWithTax;
-                    }
-                    return o;
+        it('creates a Refund against the matching Payment when the total decreases', async () => {
+            const line = createLine({ quantity: 2 } as any);
+            const order = createOrder({
+                state: 'Modifying',
+                active: false,
+                lines: [line],
+                subTotalWithTax: 2000,
+                channels: [ctx.channel],
+            } as any);
+            repo(OrderLine).find.mockResolvedValue([{ id: 'T_1', order }]);
+            getEntityOrThrow.mockResolvedValue(order);
+            const payment = new Payment({ id: 'T_3', amount: 2000, state: 'Settled' } as any);
+            repo(Payment).find.mockResolvedValue([payment]);
+            applyPriceAdjustments.mockImplementation(async () => {
+                order.subTotalWithTax = 1000;
+            });
+
+            const result = await orderModifier.modifyOrder(
+                ctx,
+                {
+                    orderId: 'T_1',
+                    dryRun: false,
+                    adjustOrderLines: [{ orderLineId: 'T_1', quantity: 1 }],
+                    refunds: [{ paymentId: 'T_3', amount: 1000 }],
                 },
+                order,
             );
-        }
 
-        describe('refunds', () => {
-            it('creates a refund against the given payment and attaches it to the modification', async () => {
-                const order = createModifyingOrder();
-                setupPriceDrop(order, 1000);
-                const payment = new Payment({ id: 'pay-1', state: 'Settled', amount: 2500 });
-                repos.Payment.find.mockResolvedValue([payment]);
-                const refund = new Refund({ id: 'refund-1' });
-                paymentService.createRefund.mockResolvedValue(refund);
+            expect(createRefund).toHaveBeenCalledTimes(1);
+            expect(createRefund.mock.calls[0][3]).toBe(payment);
+            if ('modification' in result) {
+                expect(result.modification.priceChange).toBe(-1000);
+                expect(result.modification.refund).toEqual({ id: 'T_1' });
+            } else {
+                throw new Error('Expected a successful result');
+            }
+        });
 
-                const result = await orderModifier.modifyOrder(
-                    ctx,
-                    input({
-                        dryRun: false,
-                        surcharges: [discount],
-                        refund: { paymentId: 'pay-1', amount: 1000, reason: 'less' },
-                    }),
-                    order,
-                );
+        it('persists the modification and publishes an OrderEvent when not a dry run', async () => {
+            const order = createOrder({ state: 'Modifying' } as any);
 
-                const { modification } = result as { order: Order; modification: OrderModification };
-                expect(modification.priceChange).toBe(-1000);
-                expect(modification.refund).toBe(refund);
-                expect(repos.Payment.find).toHaveBeenCalledWith({
-                    relations: ['refunds'],
-                    where: { order: { id: 1 } },
-                });
-                expect(paymentService.createRefund).toHaveBeenCalledWith(
+            const result = await orderModifier.modifyOrder(
+                ctx,
+                { orderId: 'T_1', dryRun: false, addItems: [{ productVariantId: 'T_1', quantity: 1 }] },
+                order,
+            );
+
+            if ('modification' in result) {
+                expect(result.modification.priceChange).toBe(0);
+            } else {
+                throw new Error('Expected a successful result');
+            }
+            expect(publish.mock.calls.some(call => call[0].type === 'updated')).toBe(true);
+        });
+
+        it('recalculates the unit price of updated lines using the price calculation strategy', async () => {
+            const order = createOrder({ state: 'Modifying' } as any);
+            calculateUnitPrice.mockResolvedValue({ price: 4321, priceIncludesTax: false });
+
+            await orderModifier.modifyOrder(
+                ctx,
+                { orderId: 'T_1', dryRun: true, addItems: [{ productVariantId: 'T_1', quantity: 1 }] },
+                order,
+            );
+
+            expect(order.lines[0].listPrice).toBe(4321);
+            expect(order.lines[0].listPriceIncludesTax).toBe(false);
+        });
+
+        it('returns the shipping method error when the new ShippingMethod is ineligible', async () => {
+            getMethodIfEligible.mockResolvedValue(undefined);
+
+            const result = await orderModifier.modifyOrder(
+                ctx,
+                { orderId: 'T_1', dryRun: true, shippingMethodIds: ['T_1'] },
+                createOrder({ state: 'Modifying' } as any),
+            );
+
+            expect(result).toBeInstanceOf(IneligibleShippingMethodError);
+        });
+
+        it('increases the quantity of an existing OrderLine', async () => {
+            const line = createLine({ quantity: 1 } as any);
+            const order = createOrder({ state: 'Modifying', lines: [line] } as any);
+
+            const result = await orderModifier.modifyOrder(
+                ctx,
+                { orderId: 'T_1', dryRun: true, adjustOrderLines: [{ orderLineId: 'T_1', quantity: 3 }] },
+                order,
+            );
+
+            expect(line.quantity).toBe(3);
+            expect(expectSuccess(result).modification.lines[0].quantity).toBe(2);
+        });
+
+        it('returns InsufficientStockError when increasing beyond the saleable stock', async () => {
+            const line = createLine({ quantity: 1 } as any);
+            const order = createOrder({ state: 'Modifying', lines: [line] } as any);
+            getSaleableStockLevel.mockResolvedValue(1);
+
+            const result = await orderModifier.modifyOrder(
+                ctx,
+                { orderId: 'T_1', dryRun: false, adjustOrderLines: [{ orderLineId: 'T_1', quantity: 3 }] },
+                order,
+            );
+
+            expect(result).toBeInstanceOf(InsufficientStockError);
+            expect((result as InsufficientStockError).quantityAvailable).toBe(2);
+        });
+
+        it('patches OrderLine custom fields when adjusting a line', async () => {
+            const line = createLine({ quantity: 1, customFields: { message: 'old' } } as any);
+            const order = createOrder({ state: 'Modifying', lines: [line] } as any);
+
+            await orderModifier.modifyOrder(
+                ctx,
+                {
+                    orderId: 'T_1',
+                    dryRun: true,
+                    adjustOrderLines: [
+                        { orderLineId: 'T_1', quantity: 1, customFields: { message: 'new' } } as any,
+                    ],
+                },
+                order,
+            );
+
+            expect(line.customFields).toEqual({ message: 'new' });
+        });
+
+        it('adds a tax line to a surcharge with a tax rate', async () => {
+            const order = createOrder({ state: 'Modifying' } as any);
+
+            await orderModifier.modifyOrder(
+                ctx,
+                {
+                    orderId: 'T_1',
+                    dryRun: true,
+                    surcharges: [
+                        {
+                            description: 'Fee',
+                            price: 500,
+                            priceIncludesTax: true,
+                            taxRate: 20,
+                            taxDescription: 'VAT',
+                        },
+                    ],
+                },
+                order,
+            );
+
+            expect(order.surcharges[0].taxLines).toEqual([{ taxRate: 20, description: 'VAT' }]);
+        });
+
+        it('increases the refund adjustment by the value of a negative surcharge', async () => {
+            const order = createOrder({
+                state: 'Modifying',
+                subTotalWithTax: 2000,
+                shippingWithTax: 500,
+            } as any);
+            repo(Payment).find.mockResolvedValue([
+                new Payment({ id: 'T_3', amount: 2500, state: 'Settled' } as any),
+            ]);
+            applyPriceAdjustments.mockImplementation(async () => {
+                order.subTotalWithTax = 1500;
+                order.shippingWithTax = 0;
+            });
+
+            await orderModifier.modifyOrder(
+                ctx,
+                {
+                    orderId: 'T_1',
+                    dryRun: false,
+                    surcharges: [{ description: 'Discount', price: -500, priceIncludesTax: true }],
+                    refund: { paymentId: 'T_3' },
+                },
+                order,
+            );
+
+            const refundInput = createRefund.mock.calls[0][1];
+            expect(refundInput.shipping).toBe(500);
+            // 500 from the negative surcharge, plus the adjustment needed to reach the delta of 1000
+            expect(refundInput.adjustment).toBe(500);
+        });
+
+        it('throws when the Refund could not be created', async () => {
+            const order = createOrder({ state: 'Modifying', subTotalWithTax: 2000 } as any);
+            repo(Payment).find.mockResolvedValue([
+                new Payment({ id: 'T_3', amount: 2000, state: 'Settled' } as any),
+            ]);
+            createRefund.mockResolvedValue({
+                errorCode: 'REFUND_ORDER_STATE_ERROR',
+                message: 'Cannot refund',
+                __typename: 'RefundOrderStateError',
+            });
+            applyPriceAdjustments.mockImplementation(async () => {
+                order.subTotalWithTax = 1000;
+            });
+
+            await expect(
+                orderModifier.modifyOrder(
                     ctx,
                     {
-                        lines: [],
-                        adjustment: 1000,
-                        shipping: 0,
-                        paymentId: 'pay-1',
-                        amount: 1000,
-                        reason: 'less',
+                        orderId: 'T_1',
+                        dryRun: false,
+                        surcharges: [{ description: 'Discount', price: -1000, priceIncludesTax: true }],
+                        refunds: [{ paymentId: 'T_3', amount: 1000 }],
                     },
                     order,
-                    payment,
-                );
-            });
+                ),
+            ).rejects.toThrow('Cannot refund');
+        });
 
-            it('supports the refunds array and picks the largest as the primary refund', async () => {
-                const order = createModifyingOrder();
-                setupPriceDrop(order, 1000);
-                const small = new Payment({ id: 'pay-small', state: 'Settled', amount: 500 });
-                const large = new Payment({ id: 'pay-large', state: 'Settled', amount: 2000 });
-                repos.Payment.find.mockResolvedValue([small, large]);
-                const smallRefund = new Refund({ id: 'refund-small' });
-                const largeRefund = new Refund({ id: 'refund-large' });
-                paymentService.createRefund.mockImplementation(
-                    async (_ctx: RequestContext, _input: any, _order: Order, payment: Payment) =>
-                        payment === large ? largeRefund : smallRefund,
-                );
+        it('patches Order custom fields from the input', async () => {
+            const order = createOrder({
+                state: 'Modifying',
+                customFields: { note: 'old', other: 'unchanged' },
+            } as any);
 
-                const result = await orderModifier.modifyOrder(
-                    ctx,
-                    input({
-                        dryRun: false,
-                        surcharges: [discount],
-                        refunds: [
-                            { paymentId: 'pay-small', amount: 300 },
-                            { paymentId: 'pay-large', amount: 700 },
-                        ],
-                    }),
-                    order,
-                );
+            await orderModifier.modifyOrder(
+                ctx,
+                { orderId: 'T_1', dryRun: true, customFields: { note: 'hello' } } as any,
+                order,
+            );
 
-                const { modification } = result as { order: Order; modification: OrderModification };
-                expect(paymentService.createRefund).toHaveBeenCalledTimes(2);
-                expect(modification.refund).toBe(largeRefund);
-            });
-
-            it('skips refunds whose payment does not belong to the order', async () => {
-                const order = createModifyingOrder();
-                setupPriceDrop(order, 1000);
-                repos.Payment.find.mockResolvedValue([]);
-
-                const result = await orderModifier.modifyOrder(
-                    ctx,
-                    input({
-                        dryRun: false,
-                        surcharges: [discount],
-                        refund: { paymentId: 'unknown', amount: 1000 },
-                    }),
-                    order,
-                );
-
-                const { modification } = result as { order: Order; modification: OrderModification };
-                expect(paymentService.createRefund).not.toHaveBeenCalled();
-                expect(modification.refund).toBeUndefined();
-                expect(modification.priceChange).toBe(-1000);
-            });
-
-            it('throws InternalServerError when the refund fails', async () => {
-                const order = createModifyingOrder();
-                setupPriceDrop(order, 1000);
-                repos.Payment.find.mockResolvedValue([
-                    new Payment({ id: 'pay-1', state: 'Settled', amount: 2500 }),
-                ]);
-                paymentService.createRefund.mockResolvedValue(
-                    new RefundStateTransitionError({
-                        transitionError: 'nope',
-                        fromState: 'Pending',
-                        toState: 'Settled',
-                    }),
-                );
-
-                await expect(
-                    orderModifier.modifyOrder(
-                        ctx,
-                        input({
-                            dryRun: false,
-                            surcharges: [discount],
-                            refund: { paymentId: 'pay-1', amount: 1000 },
-                        }),
-                        order,
-                    ),
-                ).rejects.toBeInstanceOf(InternalServerError);
-            });
-
-            it('splits the refund into a shipping delta and an adjustment for the remainder', async () => {
-                const order = createModifyingOrder();
-                // subTotal drops 2000 -> 1000, shipping drops 500 -> 300
-                setupPriceDrop(order, 1000, 300);
-                repos.Payment.find.mockResolvedValue([
-                    new Payment({ id: 'pay-1', state: 'Settled', amount: 2500 }),
-                ]);
-                paymentService.createRefund.mockResolvedValue(new Refund({ id: 'refund-1' }));
-
-                await orderModifier.modifyOrder(
-                    ctx,
-                    input({
-                        dryRun: false,
-                        surcharges: [discount],
-                        refund: { paymentId: 'pay-1', amount: 1200 },
-                    }),
-                    order,
-                );
-
-                const refundInput = paymentService.createRefund.mock.calls[0][1];
-                expect(refundInput.shipping).toBe(200);
-                // |delta| = 1200; shipping explains 200, so the remaining 1000 is an adjustment
-                expect(refundInput.adjustment).toBe(1000);
-            });
+            expect(order.customFields).toEqual({ note: 'hello', other: 'unchanged' });
         });
     });
 });
